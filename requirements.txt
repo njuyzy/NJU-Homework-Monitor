@@ -1,0 +1,6 @@
+beautifulsoup4
+cryptography
+playwright
+PySide6
+requests
+windows-toasts; sys_platform == "win32"

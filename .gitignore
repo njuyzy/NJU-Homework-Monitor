@@ -1,0 +1,13 @@
+.venv/
+data/
+__pycache__/
+.pytest_cache/
+work/
+assignments/
+build/
+dist/
+.crush/
+.runner_system_id
+*.spec
+ui*-preview.png
+*.log

@@ -13,14 +13,16 @@ from PySide6.QtGui import QColor, QDesktopServices, QPainter
 from PySide6.QtWidgets import (
     QAbstractButton, QApplication, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame,
     QGraphicsOpacityEffect, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea,
+    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QScrollArea,
     QSizePolicy, QSplitter, QStackedWidget, QTextBrowser, QTextEdit, QVBoxLayout,
     QWidget,
 )
 
 import app as backend
 import storage
-from codex_bridge import bridge
+from ai_tasks import manager as bridge
+from ai_models import ModelClient, configuration, model_profiles, save_configuration
+from ai_presets import PRESETS, preset_configuration
 from windows_integration import acquire_instance_lock, autostart, capabilities, release_instance_lock
 
 
@@ -38,7 +40,7 @@ STATUS_TEXT = {'pending': '未提交', 'draft': '草稿', 'submitted': '已提�
 STATUS_BADGE = {'pending': (AMBER, '#f7ecd9'), 'draft': (AMBER, '#f7ecd9'),
                 'submitted': (GREEN, '#e8f3ef'), 'unknown': (MUTED, '#f0eef2')}
 JOB_TEXT = {'starting': '正在启动', 'running': '处理中', 'completed': '已完成',
-            'failed': '失败', 'error': '需要处理', 'interrupted': '已暂停'}
+            'failed': '失败', 'error': '需要处理', 'interrupted': '已暂停', 'stopping': '正在停止'}
 
 
 def format_date(value):
@@ -170,7 +172,7 @@ class TaskCard(QFrame):
         text.addLayout(meta)
         actions = QVBoxLayout()
         actions.setSpacing(8)
-        ai = QPushButton('✦ Codex 处理中' if job and job.get('state') in ('starting', 'running') else '✦ AI 一键完成')
+        ai = QPushButton('✦ AI 处理中' if job and job.get('state') in ('starting', 'running') else '✦ AI 一键完成')
         ai.setObjectName('softButton')
         ai.setEnabled(not job or job.get('state') not in ('starting', 'running'))
         ai.clicked.connect(lambda: self.launch_ai.emit(task['id']))
@@ -227,7 +229,7 @@ class MainWindow(QMainWindow):
         self.signatures = {}
         self.nav_buttons = []
         self.active_workers = set()
-        self.nav_names = ('作业总览', 'Codex 任务', '我的课程', '提醒设置')
+        self.nav_names = ('作业总览', 'AI 任务', '我的课程', '提醒设置')
         self.page_animation = None
         self.build_ui()
         self.apply_style()
@@ -236,9 +238,9 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh_ui)
         self.timer.start(2000)
-        self.codex_timer = QTimer(self)
-        self.codex_timer.timeout.connect(self.render_codex)
-        self.codex_timer.start(350)
+        self.ai_timer = QTimer(self)
+        self.ai_timer.timeout.connect(self.render_ai)
+        self.ai_timer.start(350)
         self.refresh_ui(force=True)
 
     def build_ui(self):
@@ -284,7 +286,7 @@ class MainWindow(QMainWindow):
         local_note = QLabel('数据保存在这台电脑\n北京时间 · UTC+8'); local_note.setObjectName('sidebarNote')
         side.addWidget(local_note)
         self.build_overview()
-        self.build_codex()
+        self.build_ai()
         self.build_courses()
         self.build_settings()
         outer.addWidget(sidebar)
@@ -392,8 +394,8 @@ class MainWindow(QMainWindow):
         self.next_deadline.setObjectName('focusText'); self.next_deadline.setWordWrap(True)
         deadline_box.addWidget(deadline_label); deadline_box.addSpacing(8); deadline_box.addWidget(self.next_deadline); deadline_box.addStretch()
         tip = QFrame(); tip.setObjectName('sideCard'); tip_box = QVBoxLayout(tip)
-        tip_title = QLabel('✧  让 Codex 帮你开个头'); tip_title.setObjectName('sectionTitle')
-        tip_text = QLabel('点击作业旁的「AI 一键完成」，将题目交给 Codex 处理。\n\n任务完成后，由你决定提交。')
+        tip_title = QLabel('✧  让 AI 帮你开个头'); tip_title.setObjectName('sectionTitle')
+        tip_text = QLabel('点击作业旁的「AI 一键完成」，将题目交给 AI 处理。\n\n任务完成后，由你决定提交。')
         tip_text.setObjectName('muted'); tip_text.setWordWrap(True)
         tip_box.addWidget(tip_title); tip_box.addWidget(tip_text)
         self.sync_info = QLabel('●  后台监控\n尚未同步'); self.sync_info.setObjectName('syncInfo')
@@ -402,39 +404,35 @@ class MainWindow(QMainWindow):
         layout.addLayout(workspace, 1)
         self.pages.addWidget(page)
 
-    def build_codex(self):
-        codex_actions = QWidget(); codex_action_row = QHBoxLayout(codex_actions)
-        codex_action_row.setContentsMargins(0, 0, 0, 0); codex_action_row.setSpacing(8)
-        refresh_output = QPushButton('↻ 刷新输出'); refresh_output.clicked.connect(lambda: self.render_codex(force=True))
+    def build_ai(self):
+        ai_actions = QWidget(); ai_action_row = QHBoxLayout(ai_actions)
+        ai_action_row.setContentsMargins(0, 0, 0, 0); ai_action_row.setSpacing(8)
+        refresh_output = QPushButton('↻ 刷新输出'); refresh_output.clicked.connect(lambda: self.render_ai(force=True))
         self.more_button = QPushButton('更多接口 ···')
         more_menu = QMenu(self.more_button)
-        self.menu_open_codex = more_menu.addAction('↗  在 Codex 中打开')
+        self.model_settings_action = more_menu.addAction('⚙  自定义模型设置')
         self.menu_open_workspace = more_menu.addAction('▣  打开工作目录')
         self.menu_copy_id = more_menu.addAction('⌁  复制任务 ID')
-        self.menu_open_codex.triggered.connect(self.open_codex)
+        self.model_settings_action.triggered.connect(self.configure_model)
         self.menu_open_workspace.triggered.connect(self.open_job_workspace)
         self.menu_copy_id.triggered.connect(self.copy_job_id)
         self.more_button.setMenu(more_menu)
-        codex_action_row.addWidget(refresh_output); codex_action_row.addWidget(self.more_button)
-        page, layout = self.page_shell('Codex 任务', '查看处理过程、继续补充要求，并接收 Codex 的实时输出。', codex_actions, eyebrow='CODEX WORKSPACE')
+        ai_action_row.addWidget(refresh_output); ai_action_row.addWidget(self.more_button)
+        page, layout = self.page_shell('AI 任务', '查看处理过程、继续补充要求，并接收 AI 的实时输出。', ai_actions, eyebrow='AI WORKSPACE')
         splitter = QSplitter()
         self.job_list = QListWidget()
         self.job_list.setMinimumWidth(205)
         self.job_list.currentItemChanged.connect(self.select_job)
         center = QFrame(); center.setObjectName('panel')
         center_layout = QVBoxLayout(center)
-        self.job_title = QLabel('选择一个 Codex 任务'); self.job_title.setObjectName('sectionTitle')
+        self.job_title = QLabel('选择一个 AI 任务'); self.job_title.setObjectName('sectionTitle')
         self.job_state = QLabel('等待任务'); self.job_state.setObjectName('badge')
         top = QHBoxLayout(); top.addWidget(self.job_title, 1); top.addWidget(self.job_state)
+        self.job_progress = QProgressBar(); self.job_progress.setRange(0, 0)
+        self.job_progress.setTextVisible(False); self.job_progress.setFixedHeight(3); self.job_progress.hide()
+        self.job_progress.setStyleSheet('QProgressBar { border: none; background: #f2edf8; } QProgressBar::chunk { background: #a98bc0; }')
         self.job_output = QTextBrowser(); self.job_output.setOpenExternalLinks(True)
-        self.approval_panel = QFrame(); self.approval_panel.setObjectName('approvalPanel')
-        approval_layout = QHBoxLayout(self.approval_panel); approval_layout.setContentsMargins(12, 9, 12, 9)
-        self.approval_text = QLabel('Codex 请求执行操作'); self.approval_text.setWordWrap(True)
-        deny = QPushButton('拒绝'); deny.clicked.connect(lambda: self.answer_approval(False))
-        allow = QPushButton('允许'); allow.setObjectName('primaryButton'); allow.clicked.connect(lambda: self.answer_approval(True))
-        approval_layout.addWidget(self.approval_text, 1); approval_layout.addWidget(deny); approval_layout.addWidget(allow)
-        self.approval_panel.hide()
-        self.job_input = QTextEdit(); self.job_input.setPlaceholderText('给 Codex 补充要求…'); self.job_input.setMaximumHeight(95)
+        self.job_input = QTextEdit(); self.job_input.setPlaceholderText('给 AI 补充要求…'); self.job_input.setMaximumHeight(95)
         attach_row = QHBoxLayout()
         self.attach_button = QPushButton('📎 附件'); self.attach_button.clicked.connect(self.attach_files)
         self.attachment_label = QLabel('未附加文件'); self.attachment_label.setObjectName('muted'); self.attachment_label.setWordWrap(True)
@@ -442,10 +440,10 @@ class MainWindow(QMainWindow):
         attach_row.addWidget(self.attach_button); attach_row.addWidget(self.attachment_label, 1); attach_row.addWidget(self.clear_attachments_button)
         actions = QHBoxLayout()
         self.stop_job = QPushButton('停止'); self.stop_job.clicked.connect(self.interrupt_job)
-        self.reconnect_job_button = QPushButton('重新连接'); self.reconnect_job_button.clicked.connect(self.reconnect_job)
+        self.reconnect_job_button = QPushButton('继续处理'); self.reconnect_job_button.clicked.connect(self.reconnect_job)
         self.send_job = QPushButton('发送 ↗'); self.send_job.setObjectName('primaryButton'); self.send_job.clicked.connect(self.continue_job)
         actions.addWidget(self.stop_job); actions.addWidget(self.reconnect_job_button); actions.addStretch(); actions.addWidget(self.send_job)
-        center_layout.addLayout(top); center_layout.addWidget(self.job_output, 1); center_layout.addWidget(self.approval_panel); center_layout.addWidget(self.job_input); center_layout.addLayout(attach_row); center_layout.addLayout(actions)
+        center_layout.addLayout(top); center_layout.addWidget(self.job_progress); center_layout.addWidget(self.job_output, 1); center_layout.addWidget(self.job_input); center_layout.addLayout(attach_row); center_layout.addLayout(actions)
         context = QFrame(); context.setObjectName('infoPanel')
         context_layout = QVBoxLayout(context); context_layout.setContentsMargins(16, 16, 16, 16)
         context_title = QLabel('任务信息'); context_title.setObjectName('sectionTitle')
@@ -494,6 +492,8 @@ class MainWindow(QMainWindow):
         form.addRow(setting_switch_row('登录失效时自动打开浏览器', '需要认证时打开登录窗口，完成后恢复同步', self.auto_login))
         form.addRow(setting_switch_row('桌面通知', '作业到达提醒时间时发送系统通知', self.notifications))
         form.addRow('检查间隔', self.interval)
+        model_button = QPushButton('配置自定义 AI 模型'); model_button.clicked.connect(self.configure_model)
+        form.addRow('AI 任务', model_button)
         self.username = QLineEdit(); self.username.setPlaceholderText('学号')
         self.password = QLineEdit(); self.password.setEchoMode(QLineEdit.EchoMode.Password); self.password.setPlaceholderText('密码')
         save_credential = QPushButton('加密保存凭据'); save_credential.clicked.connect(self.save_credentials)
@@ -540,7 +540,6 @@ class MainWindow(QMainWindow):
             #focusLabel {{ color: #a18bb2; font-size: 11px; }}
             #focusText {{ color: #766185; font-size: 13px; line-height: 1.7; }}
             #syncInfo {{ color: #8f8995; font-size: 10px; line-height: 1.8; padding: 8px; }}
-            #approvalPanel {{ background: #fff7e8; border: 1px solid #ead9b8; border-radius: 9px; }}
             #contextText {{ color: #6f6875; font-size: 11px; line-height: 1.7; }}
             #fileList {{ background: #fbfbfc; border: 1px solid #ece8ef; border-radius: 8px; }}
             #statCard {{ min-width: 118px; }}
@@ -593,7 +592,7 @@ class MainWindow(QMainWindow):
         self.page_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
         self.page_animation.finished.connect(lambda: page.setGraphicsEffect(None))
         self.page_animation.start()
-        if index == 1: self.render_codex(force=True)
+        if index == 1: self.render_ai(force=True)
 
     def run_async(self, function, success=None):
         worker = Worker(function)
@@ -622,7 +621,7 @@ class MainWindow(QMainWindow):
         tasks = self.snapshot.get('tasks', [])
         pending_count = len([task for task in tasks if task.get('status') in ('pending', 'draft', 'unknown')])
         self.nav_buttons[0].setText(f'▦   作业总览                         {pending_count}')
-        self.nav_buttons[1].setText(f'✦   Codex 任务                       {len(bridge.jobs_snapshot())}')
+        self.nav_buttons[1].setText(f'✦   AI 任务                       {len(bridge.jobs_snapshot())}')
         last_sync = self.snapshot.get('last_sync')
         sync_text = format_date(last_sync) if last_sync else '尚未同步'
         self.sync_info.setText(f'●  后台监控\n{sync_text}')
@@ -638,7 +637,7 @@ class MainWindow(QMainWindow):
         self.render_stats()
         self.render_tasks(force)
         self.render_courses(force)
-        self.render_codex(force)
+        self.render_ai(force)
         self.render_settings()
 
     def render_stats(self):
@@ -693,7 +692,7 @@ class MainWindow(QMainWindow):
         for task in tasks:
             card = TaskCard(task, jobs.get(task['id']))
             card.details.connect(self.show_task)
-            card.launch_ai.connect(self.launch_codex)
+            card.launch_ai.connect(self.launch_ai)
             self.task_layout.addWidget(card)
         if not tasks:
             empty = QLabel('⌁\n\n这里暂时没有符合条件的作业。')
@@ -718,24 +717,23 @@ class MainWindow(QMainWindow):
             self.course_layout.setRowStretch((len(courses) + 2) // 3, 1)
         QTimer.singleShot(0, lambda: self.course_scroll.verticalScrollBar().setValue(scroll_value))
 
-    def render_codex(self, force=False):
+    def render_ai(self, force=False):
         job_map = bridge.jobs_snapshot()
         jobs = sorted(job_map.values(), key=lambda job: job.get('created_at', 0), reverse=True)
         files = bridge.workspace_files(self.selected_job) if self.selected_job else []
-        approvals = bridge.approvals_snapshot()
-        signature = json.dumps([jobs, self.selected_job, files, approvals, bridge.connection_state], ensure_ascii=False, default=str)
-        if not force and self.signatures.get('codex') == signature: return
-        self.signatures['codex'] = signature
+        signature = json.dumps([jobs, self.selected_job, files], ensure_ascii=False, default=str)
+        if not force and self.signatures.get('ai') == signature: return
+        self.signatures['ai'] = signature
         current = self.selected_job
-        list_signature = [(job.get('task_id'), job.get('state'), job.get('title'), job.get('course')) for job in jobs]
-        if force or self.signatures.get('codex_list') != list_signature:
-            self.signatures['codex_list'] = list_signature
+        list_signature = [(job.get('task_id'), job.get('state'), job.get('title'), job.get('course'), len(job.get('pending_prompts', []))) for job in jobs]
+        if force or self.signatures.get('ai_list') != list_signature:
+            self.signatures['ai_list'] = list_signature
             self.job_list.blockSignals(True)
             self.job_list.clear()
             for job in jobs:
                 queued = len(job.get('pending_prompts', []))
                 suffix = f' · 排队 {queued}' if queued else ''
-                item = QListWidgetItem(f"{job.get('title', 'Codex 任务')}\n{job.get('course', '')} · {JOB_TEXT.get(job.get('state'), job.get('state', ''))}{suffix}")
+                item = QListWidgetItem(f"{job.get('title', 'AI 任务')}\n{job.get('course', '')} · {JOB_TEXT.get(job.get('state'), job.get('state', ''))}{suffix}")
                 item.setData(Qt.ItemDataRole.UserRole, job['task_id'])
                 self.job_list.addItem(item)
                 if job['task_id'] == current: self.job_list.setCurrentItem(item)
@@ -744,40 +742,36 @@ class MainWindow(QMainWindow):
             self.job_list.blockSignals(False)
         job = job_map.get(self.selected_job)
         if not job:
-            self.job_title.setText('选择一个 Codex 任务'); self.job_state.setText('等待任务')
-            self.job_output.setPlainText('✦\n\nCodex 输出会同步到这里\n\n启动作业任务后，可以留在本页查看进度并继续对话。')
+            self.job_progress.hide()
+            self.job_title.setText('选择一个 AI 任务'); self.job_state.setText('等待任务')
+            self.job_output.setPlainText('✦\n\nAI 输出会同步到这里\n\n启动作业任务后，可以留在本页查看进度并继续对话。')
             for button in (self.stop_job, self.reconnect_job_button, self.send_job, self.attach_button): button.setEnabled(False)
-            for action in (self.menu_open_codex, self.menu_open_workspace, self.menu_copy_id): action.setEnabled(False)
+            for action in (self.menu_open_workspace, self.menu_copy_id): action.setEnabled(False)
             self.job_input.setEnabled(False)
             self.clear_attachments_button.setEnabled(False)
-            self.approval_panel.hide()
             self.job_files.clear()
             return
-        self.job_title.setText(job.get('title', 'Codex 任务')); self.job_state.setText(JOB_TEXT.get(job.get('state'), job.get('state', '')))
+        self.job_title.setText(job.get('title', 'AI 任务')); self.job_state.setText(JOB_TEXT.get(job.get('state'), job.get('state', '')))
         blocks = []
-        for entry in job.get('entries', []): blocks.append(('你' if entry.get('role') == 'user' else 'Codex') + '\n' + entry.get('text', ''))
+        for entry in job.get('entries', [])[-200:]: blocks.append({'user': '你', 'assistant': 'AI', 'tool': '工具'}.get(entry.get('role'), 'AI') + '\n' + entry.get('text', ''))
         if job.get('state') in ('starting', 'running'): blocks.append('处理动态\n' + job.get('activity', job.get('message', '正在处理…')))
+        bar = self.job_output.verticalScrollBar()
+        follow = bar.maximum() - bar.value() < 30
+        old_scroll = bar.value()
         self.job_output.setPlainText('\n\n'.join(blocks) or job.get('message', '等待输出'))
-        bar = self.job_output.verticalScrollBar(); bar.setValue(bar.maximum())
+        bar.setValue(bar.maximum() if follow else old_scroll)
         running = job.get('state') in ('starting', 'running')
-        self.stop_job.setEnabled(running and bool(job.get('turn_id')))
-        self.reconnect_job_button.setEnabled(not running)
-        self.menu_open_codex.setEnabled(bool(job.get('url') or job.get('fallback_url')))
+        self.job_progress.setVisible(running or job.get('state') == 'stopping')
+        self.stop_job.setEnabled(running)
+        self.reconnect_job_button.setEnabled(not running and job.get('state') != 'stopping')
         self.menu_open_workspace.setEnabled(bool(job.get('workspace')))
-        self.menu_copy_id.setEnabled(bool(job.get('thread_id') or job.get('task_id')))
-        self.send_job.setEnabled(True)
+        self.menu_copy_id.setEnabled(bool(job.get('task_id')))
+        self.send_job.setEnabled(job.get('state') != 'stopping')
         self.send_job.setText('加入队列 ↗' if running else '发送 ↗')
         self.job_input.setEnabled(True)
         self.attach_button.setEnabled(True)
         queued = len(job.get('pending_prompts', []))
-        connection = {'connected': '已连接', 'connecting': '连接中', 'error': '连接异常', 'disconnected': '未连接'}.get(bridge.connection_state, bridge.connection_state)
-        self.job_info.setText(f"课程\n{job.get('course', '—')}\n\n截止时间\n{format_date(job.get('due'))}\n\nCodex 连接\n{connection}\n\n当前状态\n{job.get('message', '—')}\n\n排队消息\n{queued} 条")
-        approval = next(((key, value) for key, value in approvals.items()
-                         if value.get('thread_id') == job.get('thread_id')), None)
-        self.current_approval = approval[0] if approval else None
-        self.approval_panel.setVisible(bool(approval))
-        if approval:
-            self.approval_text.setText('Codex 请求确认：' + str(approval[1].get('description', '执行操作'))[:260])
+        self.job_info.setText(f"课程\n{job.get('course', '—')}\n\n截止时间\n{format_date(job.get('due'))}\n\n使用模型\n{job.get('model', '未配置')}\n\n当前状态\n{job.get('message', '—')}\n\n排队消息\n{queued} 条")
         selected_path = self.job_files.currentItem().data(Qt.ItemDataRole.UserRole) if self.job_files.currentItem() else None
         self.job_files.clear()
         for file in files:
@@ -812,26 +806,26 @@ class MainWindow(QMainWindow):
         description = QTextBrowser(); description.setPlainText(task.get('description') or '请打开原作业查看详细要求。')
         buttons = QHBoxLayout()
         source = QPushButton('打开原作业 ↗'); source.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(task.get('url', ''))))
-        ai = QPushButton('✦ AI 一键完成'); ai.setObjectName('primaryButton'); ai.clicked.connect(lambda: (dialog.accept(), self.launch_codex(task_id)))
+        ai = QPushButton('✦ AI 一键完成'); ai.setObjectName('primaryButton'); ai.clicked.connect(lambda: (dialog.accept(), self.launch_ai(task_id)))
         buttons.addWidget(source); buttons.addStretch(); buttons.addWidget(ai)
         layout.addWidget(QLabel(task.get('course', ''))); layout.addWidget(title); layout.addWidget(QLabel(format_date(task.get('due')))); layout.addWidget(description, 1); layout.addLayout(buttons)
         dialog.exec()
 
-    def launch_codex(self, task_id):
+    def launch_ai(self, task_id):
         task = next((t for t in self.snapshot.get('tasks', []) if t['id'] == task_id), None)
         if not task: return
         try:
             bridge.launch(task); self.selected_job = task_id; self.switch_page(1); self.refresh_ui(force=True)
-            self.statusBar().showMessage('Codex 已在后台启动', 3500)
+            self.statusBar().showMessage('AI 已在后台启动', 3500)
         except Exception as error:
-            QMessageBox.warning(self, 'Codex 未启动', str(error))
+            QMessageBox.warning(self, 'AI 未启动', str(error))
 
     def select_job(self, current, previous=None):
         if current:
             self.selected_job = current.data(Qt.ItemDataRole.UserRole)
             self.pending_attachments = []
             self.update_attachment_label()
-            self.render_codex(force=True)
+            self.render_ai(force=True)
 
     def update_attachment_label(self):
         count = len(self.pending_attachments)
@@ -874,34 +868,23 @@ class MainWindow(QMainWindow):
         task_id = self.selected_job
         if task_id:
             self.stop_job.setEnabled(False)
-            self.run_async(lambda: bridge.interrupt(task_id), '任务已停止')
+            self.run_async(lambda: bridge.interrupt(task_id), '停止请求已处理')
 
     def reconnect_job(self):
         task_id = self.selected_job
         if task_id:
-            bridge.reconnect(task_id)
-            self.render_codex(force=True)
-
-    def answer_approval(self, accept):
-        key = getattr(self, 'current_approval', None)
-        if key:
             try:
-                bridge.approve(key, accept)
-                self.render_codex(force=True)
+                bridge.reconnect(task_id)
+                self.render_ai(force=True)
             except Exception as error:
-                QMessageBox.warning(self, '处理失败', str(error))
-
-    def open_codex(self):
-        job = bridge.get_job(self.selected_job) or {}
-        url = job.get('url') or job.get('fallback_url')
-        if url: QDesktopServices.openUrl(QUrl(url))
+                QMessageBox.warning(self, '继续失败', str(error))
 
     def open_job_workspace(self):
         if self.selected_job: self.run_async(lambda: bridge.open_workspace(self.selected_job))
 
     def copy_job_id(self):
         job = bridge.get_job(self.selected_job) or {}
-        value = job.get('thread_id') or job.get('task_id')
+        value = job.get('task_id')
         if value:
             QApplication.clipboard().setText(str(value))
             self.statusBar().showMessage('任务 ID 已复制', 2500)
@@ -935,9 +918,97 @@ class MainWindow(QMainWindow):
         storage.write('credentials.dpapi', {'username': username, 'password': password}, secret=True)
         self.password.clear(); self.statusBar().showMessage('凭据已加密保存在本机', 3500)
 
+    def configure_model(self):
+        try:
+            cfg = configuration()
+            profiles = model_profiles()
+        except Exception as error:
+            QMessageBox.warning(self, '无法读取模型配置', str(error))
+            return
+        dialog = QDialog(self); dialog.setWindowTitle('AI 模型设置'); dialog.setMinimumWidth(620)
+        form = QFormLayout(dialog); form.setSpacing(14)
+        hint = QLabel('选择常见服务商，自动填写 API 地址与模型；也可自定义。\n作业内容与读取的附件会发送给你配置的模型服务。')
+        hint.setWordWrap(True); form.addRow(hint)
+        provider = QComboBox(); provider.setObjectName('modelProvider')
+        for name, preset in PRESETS.items(): provider.addItem(preset['label'], name)
+        provider.setCurrentIndex(max(0, provider.findData(cfg['provider'])))
+        form.addRow('模型服务商', provider)
+        url = QLineEdit(cfg['base_url']); url.setPlaceholderText('https://服务地址/v1 或 http://localhost:端口/v1')
+        url.setObjectName('modelBaseUrl')
+        model = QComboBox(); model.setEditable(True); model.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        model.setObjectName('modelName'); model.addItems(PRESETS[cfg['provider']]['models']); model.setCurrentText(cfg['model'])
+        model.lineEdit().setPlaceholderText('选择预设，或直接输入模型 ID')
+        key = QLineEdit(cfg['api_key']); key.setEchoMode(QLineEdit.EchoMode.Password)
+        key.setObjectName('modelApiKey')
+        key.setPlaceholderText('API Key（无需鉴权的本地服务可留空）')
+        stream = ToggleSwitch(); stream.setChecked(cfg['stream'])
+        vision = ToggleSwitch(); vision.setChecked(cfg['vision'])
+        timeout = QLineEdit(str(cfg['timeout'])); rounds = QLineEdit(str(cfg['max_rounds']))
+        timeout.setObjectName('modelTimeout'); rounds.setObjectName('modelRounds')
+        form.addRow('API 地址', url); form.addRow('模型名称', model); form.addRow('API Key', key)
+        provider_note = QLabel(); provider_note.setObjectName('muted'); provider_note.setWordWrap(True)
+        form.addRow(provider_note)
+        form.addRow('流式输出', stream); form.addRow('视觉输入（模型需支持）', vision)
+        form.addRow('请求超时 / 秒', timeout); form.addRow('工具循环上限', rounds)
+        note = QLabel('各服务商的配置分别加密保存；点击保存后切换生效。\n地址、模型名均可修改；模型是否可用以账号权限和连接测试为准。')
+        note.setObjectName('muted'); note.setWordWrap(True); form.addRow(note)
+        actions = QHBoxLayout()
+        test = QPushButton('测试连接与工具调用'); save = QPushButton('保存配置'); save.setObjectName('primaryButton')
+        actions.addWidget(test); actions.addStretch(); actions.addWidget(save); form.addRow(actions)
+
+        def values():
+            return {'provider': provider.currentData(), 'base_url': url.text(), 'model': model.currentText(), 'api_key': key.text().strip(),
+                    'stream': stream.isChecked(), 'vision': vision.isChecked(),
+                    'timeout': timeout.text(), 'max_rounds': rounds.text()}
+
+        selected_provider = cfg['provider']
+
+        def update_provider_note():
+            provider_note.setText(PRESETS[provider.currentData()]['note'])
+
+        def select_provider():
+            nonlocal selected_provider
+            # Remember unfinished edits within this dialog; save only when the user clicks Save.
+            previous = values(); previous['provider'] = selected_provider
+            profiles[selected_provider] = previous
+            selected_provider = provider.currentData()
+            chosen = profiles.get(selected_provider) or preset_configuration(selected_provider)
+            url.setText(chosen['base_url']); key.setText(chosen['api_key'])
+            model.clear(); model.addItems(PRESETS[selected_provider]['models']); model.setCurrentText(chosen['model'])
+            stream.setChecked(chosen['stream']); vision.setChecked(chosen['vision'])
+            timeout.setText(str(chosen['timeout'])); rounds.setText(str(chosen['max_rounds']))
+            update_provider_note()
+
+        update_provider_note()
+        provider.currentIndexChanged.connect(select_provider)
+
+        def save_model():
+            try:
+                save_configuration(values())
+                dialog.accept()
+                self.statusBar().showMessage('模型配置已加密保存', 3500)
+            except Exception as error:
+                QMessageBox.warning(dialog, '配置无效', str(error))
+
+        def test_model():
+            from ai_tools import SCHEMAS
+            try:
+                client = ModelClient(values())
+            except Exception as error:
+                QMessageBox.warning(dialog, '配置无效', str(error)); return
+            def check():
+                answer = client.complete([{'role': 'user', 'content': '请调用 list_files 工具，path 为 .。不要直接回复文字。'}],
+                                         [SCHEMAS[0]], threading.Event())
+                if not any(c['function']['name'] == 'list_files' for c in answer.get('tool_calls', [])):
+                    raise RuntimeError('模型可以连接，但没有返回工具调用。请确认模型和接口支持 tools。')
+            self.run_async(check, '模型连接与工具调用测试通过')
+
+        save.clicked.connect(save_model); test.clicked.connect(test_model)
+        dialog.exec()
+
     def closeEvent(self, event):
         self.timer.stop()
-        self.codex_timer.stop()
+        self.ai_timer.stop()
         backend.stop.set(); backend.wake.set(); bridge.close(); event.accept()
 
 

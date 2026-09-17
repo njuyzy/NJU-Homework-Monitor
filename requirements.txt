@@ -2,5 +2,11 @@ beautifulsoup4
 cryptography
 playwright
 PySide6
-requests
+requests>=2.32.2
+pypdf
+python-docx
+openpyxl
+python-pptx
+Pillow
+reportlab
 windows-toasts; sys_platform == "win32"

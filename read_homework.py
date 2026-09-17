@@ -1,12 +1,15 @@
 """Read a single assignment and download its NJU-hosted attachments with saved session."""
 import argparse
 import json
+import time
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 from moodle import Moodle, safe_url, soup, text
+from ai_tools import MAX_FILE, check_file_type
+from ai_models import Cancelled
 
 
-def read_assignment(url, out):
+def read_assignment(url, out, cancel=None):
     out = Path(out)
     if not safe_url(url) or urlparse(url).path not in ('/mod/assign/view.php', '/mod/quiz/view.php'):
         raise ValueError('仅允许读取南大学习平台作业或测验页面。')
@@ -18,16 +21,38 @@ def read_assignment(url, out):
     manifest = []
     intro = doc.select_one('#intro')
     for i, a in enumerate(intro.select('a[href]') if intro else []):
+        if cancel and cancel.is_set():
+            raise Cancelled()
         url = a['href']
         if safe_url(url) and 'pluginfile.php' in url:
-            result = client.request('GET', url)
-            if 'text/html' in result.headers.get('Content-Type', ''):
-                continue
-            suffix = Path(urlparse(url).path).suffix
+            suffix = Path(unquote(urlparse(url).path)).suffix
             if len(suffix) > 12 or not suffix.replace('.', '').isalnum():
                 suffix = '.bin'
             name = f'attachment-{i+1}{suffix}'
-            (out / name).write_bytes(result.content)
+            try:
+                check_file_type(name)
+            except ValueError:
+                continue
+            with client.request('GET', url, stream=True) as result:
+                mime = result.headers.get('Content-Type', '')
+                if 'text/html' in mime:
+                    continue
+                try:
+                    check_file_type(name, mime=mime)
+                    raw = bytearray()
+                    deadline = time.monotonic() + 90
+                    for chunk in result.iter_content(65536):
+                        if cancel and cancel.is_set():
+                            raise Cancelled()
+                        if time.monotonic() > deadline:
+                            raise ValueError('附件下载超时。')
+                        raw.extend(chunk)
+                        check_file_type(name, raw[:32], mime)
+                        if len(raw) > MAX_FILE:
+                            raise ValueError('附件过大。')
+                except ValueError:
+                    continue
+            (out / name).write_bytes(raw)
             manifest.append({'file': name, 'name': text(a), 'url': url})
     (out / 'attachments.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
     return manifest

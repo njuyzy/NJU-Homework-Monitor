@@ -6,7 +6,6 @@ from datetime import datetime
 import storage
 from moodle import Moodle, LoginRequired, TZ
 from windows_integration import capabilities, login_process, notify
-from codex_bridge import bridge
 
 sync_lock = threading.Lock()
 stop = threading.Event()

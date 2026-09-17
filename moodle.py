@@ -146,6 +146,7 @@ class Moodle:
                 raise LoginRequired('网站跳转到新的认证地址，请在浏览器中核实。')
             response = self.session.request(method, url, timeout=(12, 30), allow_redirects=False, **kwargs)
             if response.status_code in (301, 302, 303, 307, 308):
+                response.close()
                 dest = urljoin(url, response.headers['Location'])
                 if response.status_code in (301, 302, 303):
                     method = 'GET'

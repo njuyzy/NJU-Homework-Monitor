@@ -8,6 +8,10 @@ if (-not (Test-Path -LiteralPath $python)) {
 Push-Location $projectRoot
 $originalPath = $env:PATH
 try {
+    $revision = (& git rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or $revision -notmatch '^[0-9a-f]{40}$') { throw 'Cannot determine build revision.' }
+    New-Item -ItemType Directory -Force -Path 'build' | Out-Null
+    @{ revision = $revision } | ConvertTo-Json | Set-Content -Encoding UTF8 -LiteralPath 'build/build-info.json'
     # Avoid PyInstaller picking up same-named ICU DLLs from unrelated tools on the host PATH.
     $env:PATH = (($env:PATH -split ';') | Where-Object {
         $_ -and $_ -notmatch '[\\/]poppler[\\/]Library[\\/]bin$'
@@ -21,6 +25,7 @@ try {
         '--name', 'NJU-Homework-Monitor', '--icon', 'static/nju-icon.ico',
         '--collect-all', 'playwright', '--collect-all', 'windows_toasts',
         '--add-data', 'static;static',
+        '--add-data', 'build/build-info.json;.',
         '--hidden-import', 'winrt.windows.ui.notifications'
     )
     foreach ($dll in @($codecvtDll, $vcompDll)) {

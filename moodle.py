@@ -76,7 +76,7 @@ def parse_assignment(html, url, course):
         cols = tr.select('th, td')
         if len(cols) >= 2:
             rows[text(cols[0]).rstrip(':：')] = text(cols[1])
-    status_raw = next((v for k, v in rows.items() if k in ('作业状态', '提交状态', 'Submission status')), '')
+    status_raw = next((v for k, v in rows.items() if k.casefold() in ('作业状态', '提交状态', 'submission status')), '')
     # Comment widgets contain hidden templates; omit them from the useful status details.
     rows.pop('提交评论', None)
     due_raw = next((v for k, v in rows.items() if any(t in k.lower() for t in ('截止', '到期', 'due date'))), '')
@@ -92,8 +92,11 @@ def parse_assignment(html, url, course):
     if not due_raw:
         for node in region.select('[data-region="activity-dates"], .activity-dates, .quizinfo p'):
             value = text(node)
-            if any(t in value.lower() for t in ('截止', '关闭', '关闭于', 'due:', 'closes')):
-                due_raw = value
+            closing = re.search(r'截止(?:时间|日期)?|关闭(?:于)?|due\s*:|closes\s*:', value, re.I)
+            if closing:
+                # A single activity-dates widget may contain BOTH opens and closes.
+                due_raw = value[closing.start():]
+                break
     due = date_value(due_raw)
     attachments = []
     for a in (desc or region).select('a[href]'):

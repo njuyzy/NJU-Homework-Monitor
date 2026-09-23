@@ -13,6 +13,7 @@ import desktop_app
 def test_ai_page_and_model_configuration(tmp_path, monkeypatch):
     monkeypatch.setattr(storage, 'DATA', tmp_path)
     monkeypatch.setattr(desktop_app.backend, 'monitor', lambda: None)
+    monkeypatch.setattr(desktop_app.MainWindow, 'check_updates', lambda self: None)
     manager = ai_tasks.TaskManager()
     monkeypatch.setattr(desktop_app, 'bridge', manager)
     app = QApplication.instance() or QApplication([])

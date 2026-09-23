@@ -54,6 +54,15 @@ def test_unrecognized_due_is_not_silently_no_due():
     assert t['due'] is None and t['warning'] and t['due_raw']=='下周四结束'
 
 
+def test_activity_dates_use_deadline_instead_of_opening_date():
+    html = '''<main id="region-main"><h2>作业</h2>
+        <div class="activity-dates">开放：2026年9月1日 08:00 截止：2026年9月30日 23:59</div>
+        <table><tr><th>Submission Status</th><td>Submitted for grading</td></tr></table></main>'''
+    task = moodle.parse_assignment(html, moodle.BASE + '/mod/assign/view.php?id=42', {'id': '3', 'name': '算法'})
+    assert task['due'] == '2026-09-30T23:59:00+08:00'
+    assert task['status'] == 'submitted'
+
+
 def test_login_html_never_becomes_assignment():
     with pytest.raises(moodle.ParseError):
         moodle.parse_assignment('<input type=password>',moodle.BASE+'/mod/assign/view.php?id=1',{'id':'3','name':'课程'})

@@ -20,6 +20,8 @@ from PySide6.QtWidgets import (
 
 import app as backend
 import storage
+import updates
+from task_status import deadline, display_status, matches_filter
 from ai_tasks import manager as bridge
 from ai_models import ModelClient, configuration, model_profiles, save_configuration
 from ai_presets import PRESETS, preset_configuration
@@ -36,9 +38,9 @@ MUTED = '#8b8d9a'
 LINE = '#ececf1'
 _resource_root = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 EMBLEM_PATH = _resource_root / 'static' / 'nju-emblem-color.png'
-STATUS_TEXT = {'pending': '未提交', 'draft': '草稿', 'submitted': '已提交', 'unknown': '待核实'}
+STATUS_TEXT = {'pending': '未提交', 'draft': '草稿', 'submitted': '已提交', 'unknown': '待核实', 'overdue': '已逾期'}
 STATUS_BADGE = {'pending': (AMBER, '#f7ecd9'), 'draft': (AMBER, '#f7ecd9'),
-                'submitted': (GREEN, '#e8f3ef'), 'unknown': (MUTED, '#f0eef2')}
+                'submitted': (GREEN, '#e8f3ef'), 'unknown': (MUTED, '#f0eef2'), 'overdue': (ROSE, '#fbecef')}
 JOB_TEXT = {'starting': '正在启动', 'running': '处理中', 'completed': '已完成',
             'failed': '失败', 'error': '需要处理', 'interrupted': '已暂停', 'stopping': '正在停止'}
 
@@ -157,8 +159,10 @@ class TaskCard(QFrame):
         title.clicked.connect(lambda: self.details.emit(task['id']))
         meta = QHBoxLayout()
         meta.setSpacing(8)
-        status = task.get('status', 'unknown')
+        status = display_status(task)
         meta.addWidget(status_badge(STATUS_TEXT.get(status, '待核实'), status))
+        if status == 'overdue' and task.get('status') == 'draft':
+            meta.addWidget(status_badge('草稿', 'draft'))
         due = QLabel(f'◷ {format_date(task.get("due"))}')
         due.setObjectName('muted')
         meta.addWidget(due)
@@ -229,6 +233,8 @@ class MainWindow(QMainWindow):
         self.signatures = {}
         self.nav_buttons = []
         self.active_workers = set()
+        self.update_info = None
+        self.checking_updates = False
         self.nav_names = ('作业总览', 'AI 任务', '我的课程', '提醒设置')
         self.page_animation = None
         self.build_ui()
@@ -242,6 +248,10 @@ class MainWindow(QMainWindow):
         self.ai_timer.timeout.connect(self.render_ai)
         self.ai_timer.start(350)
         self.refresh_ui(force=True)
+        self.update_timer = QTimer(self)
+        self.update_timer.timeout.connect(self.check_updates)
+        self.update_timer.start(15 * 60 * 1000)
+        QTimer.singleShot(0, self.check_updates)
 
     def build_ui(self):
         root = QWidget()
@@ -331,20 +341,34 @@ class MainWindow(QMainWindow):
         self.sync_button = QPushButton('↻ 立即同步')
         self.sync_button.setObjectName('primaryButton')
         self.sync_button.clicked.connect(lambda: self.run_async(backend.sync, '同步完成'))
-        page, layout = self.page_shell('每份作业，都有着落。', '未完成的任务和截止时间，一眼看清。', self.sync_button, eyebrow='LESS RUSH. MORE FOCUS.')
+        self.update_button = QPushButton('发现更新')
+        self.update_button.setObjectName('softButton')
+        self.update_button.hide()
+        self.update_button.clicked.connect(self.open_update)
+        actions = QWidget(); action_row = QHBoxLayout(actions)
+        action_row.setContentsMargins(0, 0, 0, 0)
+        action_row.addWidget(self.update_button); action_row.addWidget(self.sync_button)
+        page, layout = self.page_shell('每份作业，都有着落。', '未完成的任务和截止时间，一眼看清。', actions, eyebrow='LESS RUSH. MORE FOCUS.')
         self.status_label = QLabel('正在读取本机状态…')
         self.status_label.setObjectName('statusBanner')
         layout.addWidget(self.status_label)
         stats = QHBoxLayout()
         stats.setSpacing(12)
         self.stat_labels = {}
+        self.stat_buttons = {}
         for key, title, sub, color in (
-            ('pending', '待完成', '未交与草稿，统一收好', PURPLE),
+            ('pending', '待完成', '未交、草稿与待核实', PURPLE),
             ('soon', '72 小时内截止', '给重要的事留一点余量', AMBER),
             ('overdue', '已逾期', '查看原网页能否补交', ROSE),
             ('submitted', '已提交', '每一次完成，都算数', GREEN),
         ):
-            card = QFrame(); card.setObjectName('statCard')
+            card = QPushButton(); card.setObjectName('statCard')
+            card.setMinimumHeight(116)
+            card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            card.setCheckable(True)
+            card.setCursor(Qt.CursorShape.PointingHandCursor)
+            card.setAccessibleName(title)
+            card.clicked.connect(lambda checked=False, mode=key: self.select_task_filter(mode))
             box = QVBoxLayout(card)
             box.setContentsMargins(16, 14, 16, 14)
             box.setSpacing(4)
@@ -355,7 +379,10 @@ class MainWindow(QMainWindow):
             box.addWidget(lab)
             box.addWidget(value)
             box.addWidget(note)
+            for label in (lab, value, note):
+                label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             self.stat_labels[key] = value
+            self.stat_buttons[key] = card
             stats.addWidget(card)
         layout.addLayout(stats)
         workspace = QHBoxLayout()
@@ -370,6 +397,10 @@ class MainWindow(QMainWindow):
         self.task_filter.addItem('待完成', 'pending')
         self.task_filter.addItem('全部', 'all')
         self.task_filter.addItem('已提交', 'submitted')
+        self.task_filter.addItem('已逾期', 'overdue')
+        self.task_filter.addItem('72 小时内截止', 'soon')
+        self.task_filter.addItem('草稿', 'draft')
+        self.task_filter.addItem('待核实', 'unknown')
         self.task_filter.currentIndexChanged.connect(lambda: self.render_tasks(force=True))
         self.task_search = QLineEdit(); self.task_search.setPlaceholderText('搜索作业…')
         self.task_search.setMaximumWidth(150); self.task_search.textChanged.connect(lambda: self.render_tasks(force=True))
@@ -543,6 +574,8 @@ class MainWindow(QMainWindow):
             #contextText {{ color: #6f6875; font-size: 11px; line-height: 1.7; }}
             #fileList {{ background: #fbfbfc; border: 1px solid #ece8ef; border-radius: 8px; }}
             #statCard {{ min-width: 118px; }}
+            #statCard:hover {{ background: #faf7fd; border-color: #baa2d0; }}
+            #statCard:checked {{ background: #f5effa; border: 2px solid {PURPLE}; }}
             #statLabel {{ color: {MUTED}; font-size: 12px; }}
             #statValue {{ font-size: 28px; font-weight: 700; }}
             #statSub {{ color: #9a91a0; font-size: 10px; }}
@@ -606,6 +639,49 @@ class MainWindow(QMainWindow):
         worker.signals.failed.connect(finished)
         self.thread_pool.start(worker)
 
+    def check_updates(self):
+        if self.checking_updates:
+            return
+        self.checking_updates = True
+        worker = Worker(updates.check_for_update)
+        self.active_workers.add(worker)
+        def finished(*args):
+            self.checking_updates = False
+            self.active_workers.discard(worker)
+        worker.signals.done.connect(self.show_update)
+        worker.signals.done.connect(finished)
+        worker.signals.failed.connect(lambda message: self.statusBar().showMessage('更新检查暂不可用，将稍后重试', 5000))
+        worker.signals.failed.connect(finished)
+        self.thread_pool.start(worker)
+
+    def show_update(self, info):
+        self.update_info = info
+        self.update_button.setVisible(bool(info))
+        if info:
+            self.update_button.setText('↑ 更新可用' if info['ready'] else '↑ 发现更新 · 打包中')
+            self.update_button.setToolTip('点击查看新版与下载说明')
+
+    def open_update(self):
+        info = self.update_info
+        if not info:
+            return
+        if info['ready']:
+            message = '新版已准备好。下载发布页中的 NJU-Homework-Monitor.exe，关闭当前程序后替换原 EXE，保留同目录的 data 文件夹即可保留设置和作业数据。'
+        else:
+            message = '发现新的代码更新，安装包尚未发布。可在构建页面查看进度，程序会自动再次检查。'
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle('应用更新')
+        dialog.setText(message)
+        open_button = dialog.addButton('打开下载页' if info['ready'] else '查看构建进度', QMessageBox.ButtonRole.AcceptRole)
+        dialog.addButton('稍后', QMessageBox.ButtonRole.RejectRole)
+        dialog.exec()
+        if dialog.clickedButton() == open_button:
+            QDesktopServices.openUrl(QUrl(info['url']))
+
+    def select_task_filter(self, mode):
+        self.task_filter.setCurrentIndex(self.task_filter.findData(mode))
+        self.render_tasks(force=True)
+
     def refresh_ui(self, force=False):
         self.snapshot = storage.read('snapshot.json', {'courses': [], 'tasks': [], 'errors': []})
         self.settings = storage.settings()
@@ -619,7 +695,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText(state.get('message', '准备同步'))
         self.sync_button.setEnabled(state.get('phase') != 'syncing')
         tasks = self.snapshot.get('tasks', [])
-        pending_count = len([task for task in tasks if task.get('status') in ('pending', 'draft', 'unknown')])
+        pending_count = sum(matches_filter(task, 'pending') for task in tasks)
         self.nav_buttons[0].setText(f'▦   作业总览                         {pending_count}')
         self.nav_buttons[1].setText(f'✦   AI 任务                       {len(bridge.jobs_snapshot())}')
         last_sync = self.snapshot.get('last_sync')
@@ -644,19 +720,10 @@ class MainWindow(QMainWindow):
         tasks = self.snapshot.get('tasks', [])
         now = datetime.now().astimezone()
         pending = [task for task in tasks if task.get('status') in ('pending', 'draft')]
-        soon = []; overdue = []
-        for task in pending:
-            if not task.get('due'): continue
-            try: hours = (datetime.fromisoformat(task['due']) - now).total_seconds() / 3600
-            except ValueError: continue
-            (overdue if hours <= 0 else soon if hours <= 72 else []).append(task)
         upcoming = []
         for task in pending:
-            try:
-                due = datetime.fromisoformat(task.get('due', ''))
-            except (TypeError, ValueError):
-                continue
-            if due > now: upcoming.append((due, task))
+            due = deadline(task)
+            if due and due > now: upcoming.append((due, task))
         if upcoming:
             due, task = min(upcoming, key=lambda item: item[0])
             hours = max(0, int((due - now).total_seconds() // 3600))
@@ -664,8 +731,8 @@ class MainWindow(QMainWindow):
             self.next_deadline.setText(f'{task.get("title", "未命名作业")}\n\n{countdown} 后截止\n{task.get("course", "")}')
         else:
             self.next_deadline.setText('暂时没有临近截止的作业。\n\n可以安心安排下一件事。')
-        values = {'pending': len(pending), 'soon': len(soon), 'overdue': len(overdue),
-                  'submitted': len([task for task in tasks if task.get('status') == 'submitted'])}
+        values = {mode: sum(matches_filter(task, mode, now) for task in tasks)
+                  for mode in self.stat_labels}
         for key, value in values.items(): self.stat_labels[key].setText(str(value))
 
     @staticmethod
@@ -676,15 +743,17 @@ class MainWindow(QMainWindow):
 
     def render_tasks(self, force=False):
         mode = self.task_filter.currentData()
+        for key, button in self.stat_buttons.items():
+            button.setChecked(key == mode)
+        now = datetime.now().astimezone()
         tasks = self.snapshot.get('tasks', [])
-        if mode == 'pending': tasks = [task for task in tasks if task.get('status') in ('pending', 'draft', 'unknown')]
-        elif mode == 'submitted': tasks = [task for task in tasks if task.get('status') == 'submitted']
+        tasks = [task for task in tasks if matches_filter(task, mode, now)]
         course_id = self.course_filter.currentData()
         if course_id and course_id != 'all': tasks = [task for task in tasks if task.get('course_id') == course_id]
         query = self.task_search.text().strip().casefold()
         if query: tasks = [task for task in tasks if query in f"{task.get('title', '')} {task.get('course', '')}".casefold()]
         jobs = bridge.jobs_snapshot()
-        signature = json.dumps([tasks, jobs, mode, course_id, query], ensure_ascii=False, default=str)
+        signature = json.dumps([tasks, [display_status(task, now) for task in tasks], jobs, mode, course_id, query], ensure_ascii=False, default=str)
         if not force and self.signatures.get('tasks') == signature: return
         self.signatures['tasks'] = signature
         scroll_value = self.task_scroll.verticalScrollBar().value()
@@ -1009,6 +1078,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self.timer.stop()
         self.ai_timer.stop()
+        self.update_timer.stop()
         backend.stop.set(); backend.wake.set(); bridge.close(); event.accept()
 
 

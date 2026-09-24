@@ -69,6 +69,7 @@ def test_unknown_and_malformed_tools(kit):
     assert 'error' in kit.execute('read_file', '{"path":1}')
     assert 'error' in kit.execute('read_file', '{"path":"a","limit":-1}')
     assert 'error' in kit.execute('read_file', '{"path":"a","extra":true}')
+    assert 'error' in kit.execute('run_code', '{"language":"python","path":"a.py","args":"bad"}')
 
 
 def test_text_binary_and_pagination(kit):
@@ -351,6 +352,95 @@ def test_symlink_escape(kit, tmp_path):
 
 def test_document_cannot_be_plain_text(kit):
     assert 'error' in kit.execute('write_file', '{"path":"fake.docx","content":"hi"}')
+
+
+def test_run_python_code_with_stdin_args_and_workspace_output(kit):
+    source = ('import sys\n'
+              'value = input().strip()\n'
+              'print(sys.argv[1], value)\n'
+              "open('outputs/result.txt', 'w', encoding='utf-8').write(value)\n")
+    kit.write_file('solve.py', source)
+    (kit.root / 'outputs').mkdir()
+    result = kit.run_code('python', 'solve.py', args=['参数'], stdin='答案\n', timeout=10)
+    assert result['phase'] == 'run' and result['exit_code'] == 0 and not result['timed_out']
+    assert '参数 答案' in result['stdout']
+    assert (kit.root / 'outputs/result.txt').read_text(encoding='utf-8') == '答案'
+
+
+@pytest.mark.parametrize('source,marker', [
+    ("print(open('../outside-secret.txt', encoding='utf-8').read())", '只能写入任务目录'),
+    ("import os; os.remove('../outside-secret.txt')", '只能修改任务目录'),
+    ("import subprocess; subprocess.run(['cmd', '/c', 'echo bad'])", '禁止网络和子进程'),
+    ("import socket; socket.create_connection(('example.com', 80))", '禁止网络和子进程'),
+])
+def test_python_runner_blocks_host_access(kit, source, marker):
+    outside = kit.root.parent / 'outside-secret.txt'; outside.write_text('secret', encoding='utf-8')
+    kit.write_file('unsafe.py', source)
+    result = kit.run_code('python', 'unsafe.py', timeout=10)
+    assert result['exit_code'] != 0 and marker in result['stderr']
+    assert outside.read_text(encoding='utf-8') == 'secret'
+
+
+def test_run_code_timeout_and_output_limit(kit):
+    kit.write_file('loop.py', "print('x' * 100000)\nwhile True: pass\n")
+    result = kit.run_code('python', 'loop.py', timeout=1)
+    assert result['timed_out'] is True
+    assert len(result['stdout']) <= ai_tools.MAX_CODE_OUTPUT + 20
+
+
+def test_run_code_rejects_wrong_extension_and_missing_runtime(kit, monkeypatch):
+    kit.write_file('answer.txt', 'print(1)')
+    assert 'error' in kit.execute('run_code', json.dumps({'language': 'python', 'path': 'answer.txt'}))
+    kit.write_file('answer.js', 'console.log(1)')
+    monkeypatch.setattr(ai_tools.shutil, 'which', lambda name: None)
+    result = kit.execute('run_code', json.dumps({'language': 'javascript', 'path': 'answer.js'}))
+    assert 'error' in result and 'Node.js' in result['error']
+
+
+def test_run_code_cancellation_kills_process(kit):
+    kit.write_file('forever.py', 'while True: pass\n')
+    state = {}
+    def run():
+        try:
+            kit.run_code('python', 'forever.py', timeout=30)
+        except BaseException as error:
+            state['error'] = error
+    worker = threading.Thread(target=run); worker.start()
+    time.sleep(.3); kit.cancel.set(); worker.join(8)
+    assert not worker.is_alive()
+    assert isinstance(state.get('error'), ai_models.Cancelled)
+
+
+def test_run_javascript_when_node_is_available(kit):
+    if not ai_tools.shutil.which('node'):
+        pytest.skip('Node.js 未安装')
+    kit.write_file('answer.js', "process.stdout.write(process.argv[2] + ':' + require('fs').readFileSync(0, 'utf8'))")
+    result = kit.run_code('javascript', 'answer.js', args=['arg'], stdin='input', timeout=10)
+    assert result['exit_code'] == 0 and result['stdout'] == 'arg:input'
+
+
+def test_run_java_when_jdk_is_available(kit):
+    if not ai_tools.shutil.which('javac') or not ai_tools.shutil.which('java'):
+        pytest.skip('JDK 未安装')
+    kit.write_file('Hello.java', 'public class Hello { public static void main(String[] a) { System.out.print("java:" + a[0]); } }')
+    result = kit.run_code('java', 'Hello.java', args=['ok'], timeout=20)
+    assert result['phase'] == 'run' and result['exit_code'] == 0 and result['stdout'] == 'java:ok'
+
+
+def test_agent_tool_cycle_can_execute_python(kit, monkeypatch):
+    kit.write_file('calc.py', 'print(6 * 7)\n')
+    calls = []
+    def complete(self, messages, schemas, cancel, delta):
+        calls.append(copy.deepcopy(messages))
+        if len(calls) == 1:
+            return {'role': 'assistant', 'content': '', 'tool_calls': [tool_call(
+                'run_code', {'language': 'python', 'path': 'calc.py', 'timeout': 10})]}
+        assert json.loads(messages[-1]['content'])['stdout'].strip() == '42'
+        return {'role': 'assistant', 'content': '计算结果为 42。'}
+    monkeypatch.setattr(ai_tasks.ModelClient, 'complete', complete)
+    job = {'task_id': 'run', 'workspace': str(kit.root), 'messages': [{'role': 'user', 'content': '计算'}], 'entries': []}
+    ai_tasks.TaskManager()._turn(job, ai_tasks.ModelClient(CONFIG), kit, threading.Event(), 3)
+    assert job['messages'][-1]['content'] == '计算结果为 42。'
 
 
 def test_redirect_to_private_network_is_rejected(kit, monkeypatch):

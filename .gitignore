@@ -7,6 +7,7 @@ assignments/
 build/
 dist/
 .crush/
+.idea/
 .runner_system_id
 *.spec
 ui*-preview.png

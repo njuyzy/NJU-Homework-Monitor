@@ -5,7 +5,11 @@ import ipaddress
 import json
 import mimetypes
 import re
+import os
+import shutil
 import socket
+import subprocess
+import sys
 import threading
 import time
 import zipfile
@@ -19,6 +23,7 @@ from ai_models import Cancelled
 
 MAX_FILE = 64 * 1024 * 1024
 MAX_CHUNK = 48000
+MAX_CODE_OUTPUT = 64000
 VIDEO_SUFFIXES = {'.mp4', '.m4v', '.mov', '.avi', '.mkv', '.webm', '.wmv', '.flv', '.mpeg',
                   '.mpg', '.3gp', '.3g2', '.ts', '.mts', '.m2ts', '.vob', '.ogv'}
 
@@ -64,6 +69,13 @@ SCHEMAS = [
            {'url': STR, 'path': STR}, ['url', 'path']),
     schema('read_assignment', '使用应用已有学校会话，重新读取当前作业正文与附件到 source/。'
            '仅当前作业，不会返回 Cookie 或密码。', {}),
+    schema('run_code', '运行当前任务目录内的源码并返回退出码、标准输出和错误输出。'
+           '支持 python、javascript、c、cpp、java；不接受 Shell 命令。运行有超时和输出限制，'
+           'Python 禁止网络、子进程及访问任务目录外的普通文件；其他语言依赖本机已安装的运行时。',
+           {'language': {'type': 'string', 'enum': ['python', 'javascript', 'c', 'cpp', 'java']},
+            'path': STR, 'args': {'type': 'array', 'items': STR, 'maxItems': 32},
+            'stdin': {'type': 'string', 'maxLength': 32000},
+            'timeout': {'type': 'integer', 'minimum': 1, 'maximum': 120}}, ['language', 'path']),
 ]
 
 
@@ -113,12 +125,7 @@ class ToolKit:
             if not isinstance(args, dict) or set(args) - set(spec['properties']) or set(spec['required']) - set(args):
                 raise ValueError('工具参数缺失或包含未知字段。')
             for key, value in args.items():
-                prop = spec['properties'][key]
-                kind = {'string': str, 'integer': int, 'boolean': bool}[prop['type']]
-                if type(value) is not kind or ('enum' in prop and value not in prop['enum']):
-                    raise ValueError(f'参数 {key} 类型或取值错误。')
-                if kind is int and (value < prop.get('minimum', value) or value > prop.get('maximum', value)):
-                    raise ValueError(f'参数 {key} 超出范围。')
+                self._validate_argument(key, value, spec['properties'][key])
             return getattr(self, name)(**args)
         except Cancelled:
             raise
@@ -127,6 +134,21 @@ class ToolKit:
             if isinstance(error, requests.RequestException):
                 return {'error': '网页请求失败或超时。'}
             return {'error': f'{type(error).__name__}: {str(error)[:400]}'}
+
+    @staticmethod
+    def _validate_argument(name, value, prop):
+        kind = {'string': str, 'integer': int, 'boolean': bool, 'array': list}[prop['type']]
+        if type(value) is not kind or ('enum' in prop and value not in prop['enum']):
+            raise ValueError(f'参数 {name} 类型或取值错误。')
+        if kind is int and (value < prop.get('minimum', value) or value > prop.get('maximum', value)):
+            raise ValueError(f'参数 {name} 超出范围。')
+        if kind is str and len(value) > prop.get('maxLength', len(value)):
+            raise ValueError(f'参数 {name} 过长。')
+        if kind is list:
+            if len(value) > prop.get('maxItems', len(value)):
+                raise ValueError(f'参数 {name} 项目过多。')
+            for index, item in enumerate(value):
+                ToolKit._validate_argument(f'{name}[{index}]', item, prop['items'])
 
     def list_files(self, path='.', offset=0):
         directory = self.path(path)
@@ -387,3 +409,119 @@ class ToolKit:
         from read_homework import read_assignment
         result = read_assignment(self.assignment_url, self.path('source'), cancel=self.cancel)
         return {'path': 'source', 'attachments': result}
+
+    def run_code(self, language, path, args=None, stdin='', timeout=20):
+        source = self.path(path)
+        if not source.is_file() or source.is_symlink():
+            raise ValueError('源码文件不存在或不能是符号链接。')
+        if source.stat().st_size > 2 * 1024 * 1024:
+            raise ValueError('源码文件不能超过 2 MB。')
+        extensions = {'python': {'.py'}, 'javascript': {'.js', '.mjs'}, 'c': {'.c'},
+                      'cpp': {'.cc', '.cpp', '.cxx'}, 'java': {'.java'}}
+        if source.suffix.lower() not in extensions[language]:
+            raise ValueError('源码扩展名与所选语言不匹配。')
+        run_root = self.path('.ai-run')
+        run_root.mkdir(exist_ok=True)
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix='exec-', dir=run_root) as temporary:
+            build = Path(temporary)
+            command, compile_command = self._code_commands(language, source, build, args or [])
+            started = time.monotonic()
+            if compile_command:
+                compiled = self._run_process(compile_command, build, '', min(timeout, 60))
+                if compiled['exit_code'] != 0:
+                    return {'language': language, 'path': path, 'phase': 'compile', **compiled}
+            remaining = max(1, timeout - int(time.monotonic() - started))
+            result = self._run_process(command, self.root, stdin, remaining)
+            return {'language': language, 'path': path, 'phase': 'run', **result}
+
+    def _code_commands(self, language, source, build, args):
+        if language == 'python':
+            if getattr(sys, 'frozen', False):
+                command = [sys.executable, '--code-worker', str(self.root), str(source), *args]
+            else:
+                command = [sys.executable, str(Path(__file__).with_name('code_runner.py')),
+                           str(self.root), str(source), *args]
+            return command, None
+        if language == 'javascript':
+            runtime = shutil.which('node')
+            if not runtime:
+                raise ValueError('未安装 Node.js，无法运行 JavaScript。')
+            return [runtime, str(source), *args], None
+        if language in ('c', 'cpp'):
+            names = ('gcc', 'clang') if language == 'c' else ('g++', 'clang++')
+            compiler = next((shutil.which(name) for name in names if shutil.which(name)), None)
+            if not compiler:
+                raise ValueError('未找到 GCC 或 Clang 编译器。')
+            output = build / ('program.exe' if os.name == 'nt' else 'program')
+            return [str(output), *args], [compiler, str(source), '-O2', '-o', str(output)]
+        javac, java = shutil.which('javac'), shutil.which('java')
+        if not javac or not java:
+            raise ValueError('未安装完整 JDK，无法编译并运行 Java。')
+        return [java, '-cp', str(build), source.stem, *args], [javac, '-encoding', 'UTF-8', '-d', str(build), str(source)]
+
+    def _run_process(self, command, cwd, stdin, timeout):
+        if self.cancel.is_set():
+            raise Cancelled()
+        safe_env = {key: os.environ[key] for key in ('PATH', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT') if key in os.environ}
+        safe_env.update(PYTHONUTF8='1', PYTHONIOENCODING='utf-8', LANG='C.UTF-8',
+                        TEMP=str(cwd), TMP=str(cwd))
+        flags = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0) if os.name == 'nt' else 0
+        process = subprocess.Popen(command, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, env=safe_env, creationflags=flags)
+        stdout, stderr = bytearray(), bytearray()
+
+        def drain(stream, target):
+            while True:
+                block = stream.read(8192)
+                if not block:
+                    return
+                if len(target) < MAX_CODE_OUTPUT:
+                    target.extend(block[:MAX_CODE_OUTPUT - len(target)])
+
+        readers = [threading.Thread(target=drain, args=(process.stdout, stdout), daemon=True),
+                   threading.Thread(target=drain, args=(process.stderr, stderr), daemon=True)]
+        for reader in readers:
+            reader.start()
+        try:
+            process.stdin.write(stdin.encode('utf-8')); process.stdin.close()
+            deadline = time.monotonic() + timeout
+            while process.poll() is None:
+                if self.cancel.is_set():
+                    self._kill_process_tree(process)
+                    raise Cancelled()
+                if time.monotonic() >= deadline:
+                    self._kill_process_tree(process)
+                    for reader in readers: reader.join(2)
+                    return self._process_result(process, stdout, stderr, timed_out=True)
+                time.sleep(.05)
+            for reader in readers: reader.join(2)
+            return self._process_result(process, stdout, stderr)
+        finally:
+            if process.poll() is None:
+                self._kill_process_tree(process)
+
+    @staticmethod
+    def _kill_process_tree(process):
+        if process.poll() is not None:
+            return
+        try:
+            if os.name == 'nt':
+                subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            else:
+                process.kill()
+        except (OSError, subprocess.SubprocessError):
+            process.kill()
+        try:
+            process.wait(5)
+        except subprocess.TimeoutExpired:
+            pass
+
+    @staticmethod
+    def _process_result(process, stdout, stderr, timed_out=False):
+        def decode(value):
+            text = bytes(value).decode('utf-8', errors='replace')
+            return text + ('\n[输出已截断]' if len(value) >= MAX_CODE_OUTPUT else '')
+        return {'exit_code': process.returncode if process.returncode is not None else -1,
+                'stdout': decode(stdout), 'stderr': decode(stderr), 'timed_out': timed_out}

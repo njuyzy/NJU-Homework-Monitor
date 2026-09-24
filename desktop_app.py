@@ -1108,6 +1108,10 @@ def main():
         sys.argv.remove('--read-homework')
         from read_homework import main as read_main
         read_main(); return 0
+    if '--code-worker' in sys.argv:
+        index = sys.argv.index('--code-worker')
+        from code_runner import main as code_main
+        code_main(sys.argv[index + 1:]); return 0
     qt_app = QApplication(sys.argv)
     qt_app.setApplicationName('课后')
     instance_lock = acquire_instance_lock()

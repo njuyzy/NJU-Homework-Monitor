@@ -6,6 +6,7 @@ import pytest
 import storage
 import moodle
 import app
+import ignored_tasks
 
 
 @pytest.fixture(autouse=True)
@@ -82,6 +83,12 @@ def test_reminder_boundaries():
     assert app.reminder_bucket(task(status='submitted'),due,[24]) is None
     assert app.reminder_bucket(task(stale=True),due,[24]) is None
     assert app.reminder_bucket(task(status='unknown'),due,[24]) is None
+
+
+def test_ignored_overdue_task_does_not_remind():
+    due = datetime.fromisoformat(task()['due'])
+    ignored_tasks.set_ignored(task())
+    assert app.reminder_bucket(task(), due, [24]) is None
 
 
 def test_dedup_and_failed_notification_retry(monkeypatch):

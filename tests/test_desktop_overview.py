@@ -39,6 +39,16 @@ def test_clickable_stats_combined_filters_and_update_button(tmp_path, monkeypatc
         assert len(visible_cards()) == int(window.stat_labels[mode].text())
     window.stat_buttons['overdue'].click()
     assert '已逾期' in [label.text() for label in visible_cards()[0].findChildren(QLabel)]
+    ignore = next(button for button in visible_cards()[0].findChildren(QPushButton) if button.text() == '忽略逾期')
+    ignore.click()
+    assert window.stat_labels['overdue'].text() == '0'
+    assert window.stat_labels['pending'].text() == '2'
+    window.task_filter.setCurrentIndex(window.task_filter.findData('ignored'))
+    assert len(visible_cards()) == 1
+    assert '已忽略' in [label.text() for label in visible_cards()[0].findChildren(QLabel)]
+    restore = next(button for button in visible_cards()[0].findChildren(QPushButton) if button.text() == '恢复关注')
+    restore.click()
+    assert window.stat_labels['overdue'].text() == '1'
     window.task_search.setText('不存在')
     assert not visible_cards()
     window.task_search.clear()

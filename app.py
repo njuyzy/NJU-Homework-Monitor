@@ -4,6 +4,7 @@ import time
 from datetime import datetime
 
 import storage
+from ignored_tasks import is_ignored
 from moodle import Moodle, LoginRequired, TZ
 from windows_integration import capabilities, login_process, notify
 
@@ -31,7 +32,7 @@ def open_login_once(manual=False):
 
 
 def reminder_bucket(task, now, hours):
-    if task['status'] not in ('pending', 'draft') or task.get('stale'):
+    if task['status'] not in ('pending', 'draft') or task.get('stale') or is_ignored(task):
         return None
     if not task.get('due'):
         return 'no-date:' + now.strftime('%Y-%m-%d')

@@ -13,6 +13,8 @@ def deadline(task):
 
 
 def display_status(task, now=None):
+    if task.get('ignored'):
+        return 'ignored'
     state = task.get('status', 'unknown')
     due = deadline(task)
     if state in ('pending', 'draft') and due and due <= (now or datetime.now(TZ)):

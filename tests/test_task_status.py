@@ -38,3 +38,12 @@ def test_naive_date_is_beijing_and_unknown_is_pending():
     assert display_status({'status': 'pending', 'due': '2026-09-23T12:00:00'}, NOW) == 'overdue'
     assert matches_filter({'status': 'unknown'}, 'pending', NOW)
     assert not matches_filter({'status': 'unknown', 'due': NOW.isoformat()}, 'overdue', NOW)
+
+
+def test_ignored_task_is_removed_from_active_filters_but_remains_discoverable():
+    task = {'status': 'pending', 'due': NOW.isoformat(), 'ignored': True}
+    assert display_status(task, NOW) == 'ignored'
+    assert matches_filter(task, 'ignored', NOW)
+    assert matches_filter(task, 'all', NOW)
+    assert not matches_filter(task, 'pending', NOW)
+    assert not matches_filter(task, 'overdue', NOW)

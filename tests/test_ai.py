@@ -52,9 +52,17 @@ def test_config_encrypted_and_validated(tmp_path):
     assert ai_models.configuration() == ai_models.DEFAULTS | CONFIG
     assert b'test-secret' not in (tmp_path / 'ai-model.dpapi').read_bytes()
     for bad in ({'base_url': 'file:///etc'}, {'base_url': 'https://key:secret@example.com'},
-                {'model': ''}, {'max_rounds': 0}, {'timeout': 2}):
+                {'model': ''}, {'max_rounds': -1}, {'timeout': -1}, {'timeout': '不限'}):
         with pytest.raises(ValueError):
             ai_models.validate_config(CONFIG | bad)
+
+
+@pytest.mark.parametrize('timeout,rounds', [(0, 0), (1, 1), (36000, 100000)])
+def test_config_accepts_unlimited_or_large_limits(timeout, rounds):
+    cfg = ai_models.save_configuration(CONFIG | {'timeout': timeout, 'max_rounds': rounds})
+    assert cfg['timeout'] == timeout and cfg['max_rounds'] == rounds
+    assert ai_models.configuration()['timeout'] == timeout
+    assert ai_models.configuration()['max_rounds'] == rounds
 
 
 @pytest.mark.parametrize('path', ['../cookies.dpapi', '/etc/passwd', 'C:/Windows/a', 'a:secret', 'NUL.txt'])
@@ -155,10 +163,10 @@ def test_stream_reassembles_tool_arguments_and_uses_custom_endpoint(monkeypatch)
              event({'tool_calls': [{'index': 0, 'id': 'call-x', 'type': 'function', 'function': {'name': 'read_file', 'arguments': '{"path":'}}]}),
              event({'tool_calls': [{'index': 0, 'function': {'arguments': '"题目.txt"}'}}]}),
              event({}, 'tool_calls'), b'data: [DONE]']
-    def post(url, **kwargs):
+    def post(self, url, **kwargs):
         seen.update(url=url, **kwargs)
         return Response(lines=lines)
-    monkeypatch.setattr(ai_models.requests, 'post', post)
+    monkeypatch.setattr(ai_models.requests.Session, 'post', post)
     deltas = []
     answer = ai_models.ModelClient(CONFIG).complete([], ai_tools.SCHEMAS, threading.Event(), deltas.append)
     assert answer['tool_calls'][0]['function']['arguments'] == '{"path":"题目.txt"}'
@@ -168,8 +176,18 @@ def test_stream_reassembles_tool_arguments_and_uses_custom_endpoint(monkeypatch)
     assert seen['headers']['Authorization'] == 'Bearer test-secret'
 
 
+def test_unlimited_request_has_no_network_timeout(monkeypatch):
+    seen = {}
+    def post(self, url, **kwargs):
+        seen.update(kwargs)
+        return Response(lines=[event({'content': '完成'}), event({}, 'stop')])
+    monkeypatch.setattr(ai_models.requests.Session, 'post', post)
+    answer = ai_models.ModelClient(CONFIG | {'timeout': 0}).complete([], [], threading.Event())
+    assert answer['content'] == '完成' and seen['timeout'] is None
+
+
 def test_truncated_stream_never_returns_partial_tool(monkeypatch):
-    monkeypatch.setattr(ai_models.requests, 'post', lambda *a, **k: Response(lines=[event({'tool_calls': [
+    monkeypatch.setattr(ai_models.requests.Session, 'post', lambda *a, **k: Response(lines=[event({'tool_calls': [
         {'index': 0, 'id': 'x', 'function': {'name': 'write_file', 'arguments': '{}'}}]})]))
     with pytest.raises(RuntimeError, match='未完整结束'):
         ai_models.ModelClient(CONFIG).complete([], [], threading.Event())
@@ -180,7 +198,7 @@ def test_stream_envelopes_do_not_exhaust_reply_limit(monkeypatch):
     monkeypatch.setattr(ai_models, 'MAX_STREAM_BYTES', 20000)
     lines = [event({'content': 'x'}) for _ in range(100)] + [event({}, 'stop')]
     assert sum(map(len, lines)) > ai_models.MAX_RESPONSE_BYTES
-    monkeypatch.setattr(ai_models.requests, 'post', lambda *a, **k: Response(lines=lines))
+    monkeypatch.setattr(ai_models.requests.Session, 'post', lambda *a, **k: Response(lines=lines))
     answer = ai_models.ModelClient(CONFIG).complete([], [], threading.Event())
     assert answer['content'] == 'x' * 100
 
@@ -192,16 +210,16 @@ def test_response_limits_still_reject_oversized_data(monkeypatch, kind):
     response = (Response(result={'choices': [{'message': {'content': 'x' * 800}, 'finish_reason': 'stop'}]})
                 if kind == 'nonstream' else Response(lines=[event({'content': 'x' * 400})] if kind == 'payload'
                                                      else [b': heartbeat ' + b'x' * 700]))
-    monkeypatch.setattr(ai_models.requests, 'post', lambda *a, **k: response)
+    monkeypatch.setattr(ai_models.requests.Session, 'post', lambda *a, **k: response)
     with pytest.raises(RuntimeError, match='过大'):
         ai_models.ModelClient(CONFIG | {'stream': kind != 'nonstream'}).complete([], [], threading.Event())
 
 
 def test_nonstream_and_http_failure(monkeypatch):
-    monkeypatch.setattr(ai_models.requests, 'post', lambda *a, **k: Response(result={
+    monkeypatch.setattr(ai_models.requests.Session, 'post', lambda *a, **k: Response(result={
         'choices': [{'message': {'content': '完成'}, 'finish_reason': 'stop'}]}))
     assert ai_models.ModelClient(CONFIG | {'stream': False}).complete([], [], threading.Event())['content'] == '完成'
-    monkeypatch.setattr(ai_models.requests, 'post', lambda *a, **k: Response(status=401))
+    monkeypatch.setattr(ai_models.requests.Session, 'post', lambda *a, **k: Response(status=401))
     with pytest.raises(RuntimeError, match='API Key 无效'):
         ai_models.ModelClient(CONFIG).complete([], [], threading.Event())
 
@@ -293,6 +311,21 @@ def test_round_limit_keeps_valid_tool_history(monkeypatch):
     assert wait_job(manager)['state'] == 'completed'
 
 
+def test_unlimited_rounds_continue_beyond_old_maximum(monkeypatch):
+    monkeypatch.setattr(ai_tasks, 'configuration', lambda: CONFIG | {'max_rounds': 0})
+    rounds = []
+    def complete(*args):
+        rounds.append(1)
+        if len(rounds) <= 105:
+            return {'role': 'assistant', 'content': '', 'tool_calls': [tool_call('list_files', {})]}
+        return {'role': 'assistant', 'content': '完成'}
+    monkeypatch.setattr(ai_tasks.ModelClient, 'complete', complete)
+    manager = ai_tasks.TaskManager(); manager.launch(task())
+    assert wait_job(manager)['state'] == 'completed'
+    assert len(rounds) == 106
+    assert len([m for m in manager.jobs['assign-1']['messages'] if m['role'] == 'tool']) == 105
+
+
 def test_timeout_after_stop_stays_interrupted(monkeypatch):
     entered = threading.Event()
     def complete(self, messages, schemas, cancel, delta):
@@ -357,8 +390,105 @@ def test_real_http_stream_to_file(tmp_path):
         server.shutdown(); server.server_close(); thread.join(2)
 
 
+@pytest.mark.parametrize('stream,phase,secure', [
+    (stream, phase, secure)
+    for stream in (True, False) for phase in ('headers', 'body') for secure in (False, True)
+])
+def test_unlimited_silent_request_can_be_stopped(tmp_path, monkeypatch, stream, phase, secure):
+    import datetime
+    import ipaddress
+    import ssl
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    entered, disconnected = threading.Event(), threading.Event()
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_POST(self):
+            self.rfile.read(int(self.headers['Content-Length']))
+            if phase == 'body':
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream' if stream else 'application/json')
+                self.end_headers()
+                self.wfile.flush()
+            entered.set()
+            self.connection.settimeout(3)
+            try:
+                if not self.connection.recv(1):
+                    disconnected.set()
+            except (OSError, ssl.SSLError):
+                disconnected.set()
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    if secure:
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subject = x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, 'localhost')])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        certificate = (x509.CertificateBuilder().subject_name(subject).issuer_name(subject)
+            .public_key(key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1)).not_valid_after(now + datetime.timedelta(days=1))
+            .add_extension(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address('127.0.0.1'))]), False)
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True).sign(key, hashes.SHA256()))
+        cert_path, key_path = tmp_path / 'server.pem', tmp_path / 'server.key'
+        cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+        key_path.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                               serialization.NoEncryption()))
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(str(cert_path), str(key_path))
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+        monkeypatch.setenv('REQUESTS_CA_BUNDLE', str(cert_path))
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True); server_thread.start()
+    cancel, errors = threading.Event(), []
+    cfg = CONFIG | {'base_url': f'{"https" if secure else "http"}://127.0.0.1:{server.server_port}/v1',
+                    'stream': stream, 'timeout': 0}
+    def request():
+        try:
+            ai_models.ModelClient(cfg).complete([], [], cancel)
+        except Exception as error:
+            errors.append(error)
+    worker = threading.Thread(target=request, daemon=True); worker.start()
+    try:
+        assert entered.wait(3), errors
+        cancel.set(); worker.join(2)
+        assert not worker.is_alive(), '停止后请求仍在等待'
+        assert len(errors) == 1 and isinstance(errors[0], ai_models.Cancelled)
+        assert disconnected.wait(2), '停止后连接没有释放'
+    finally:
+        cancel.set()
+        server.shutdown(); server.server_close(); server_thread.join(2)
+
+
+def test_finite_timeout_interrupts_silent_headers():
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    entered, disconnected = threading.Event(), threading.Event()
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_POST(self):
+            self.rfile.read(int(self.headers['Content-Length']))
+            entered.set()
+            self.connection.settimeout(3)
+            try:
+                self.connection.recv(1)
+            except OSError:
+                pass
+            disconnected.set()
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+    try:
+        cfg = CONFIG | {'base_url': f'http://127.0.0.1:{server.server_port}/v1', 'timeout': 1}
+        started = time.monotonic()
+        with pytest.raises(RuntimeError):
+            ai_models.ModelClient(cfg).complete([], [], threading.Event())
+        assert entered.is_set() and time.monotonic() - started < 3
+        assert disconnected.wait(2)
+    finally:
+        server.shutdown(); server.server_close(); thread.join(2)
+
+
 def test_reasoning_content_preserved_for_compatible_models(monkeypatch):
-    monkeypatch.setattr(ai_models.requests, 'post', lambda *a, **k: Response(lines=[
+    monkeypatch.setattr(ai_models.requests.Session, 'post', lambda *a, **k: Response(lines=[
         event({'reasoning_content': '检查文件'}), event({'content': '答案'}), event({}, 'stop')]))
     answer = ai_models.ModelClient(CONFIG).complete([], [], threading.Event())
     assert answer['reasoning_content'] == '检查文件'
@@ -542,7 +672,7 @@ def test_provider_profiles_keep_separate_keys_and_restore_legacy(tmp_path):
 
 def test_gemini_stream_preserves_tool_signature(monkeypatch):
     signature = {'google': {'thought_signature': 'opaque-provider-signature'}}
-    monkeypatch.setattr(ai_models.requests, 'post', lambda *a, **k: Response(lines=[
+    monkeypatch.setattr(ai_models.requests.Session, 'post', lambda *a, **k: Response(lines=[
         event({'tool_calls': [tool_call('list_files', {}) | {'index': 0}]}),
         event({'tool_calls': [{'index': 0, 'extra_content': signature}]}), event({}, 'tool_calls')]))
     answer = ai_models.ModelClient(CONFIG).complete([], [], threading.Event())
@@ -554,11 +684,11 @@ def test_preset_request_url_and_auth(provider, monkeypatch):
     from ai_presets import preset_configuration
     cfg = preset_configuration(provider) | {'api_key': 'provider-key'}
     seen = {}
-    def post(url, **kwargs):
+    def post(self, url, **kwargs):
         seen.update(url=url, **kwargs)
         return Response(result={'choices': [{'finish_reason': 'tool_calls', 'message': {
             'content': '', 'tool_calls': [tool_call('list_files', {})]}}]})
-    monkeypatch.setattr(ai_models.requests, 'post', post)
+    monkeypatch.setattr(ai_models.requests.Session, 'post', post)
     ai_models.ModelClient(cfg).complete([], ai_tools.SCHEMAS, threading.Event())
     assert seen['url'] == cfg['base_url'] + '/chat/completions'
     assert seen['headers']['Authorization'] == 'Bearer provider-key'

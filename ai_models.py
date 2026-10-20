@@ -1,22 +1,18 @@
 """Configurable Chat Completions transport; no external agent runtime required."""
 import json
 import copy
-import time
 from urllib.parse import urlsplit
 
 import requests
 import storage
 from ai_presets import PRESETS, detect_provider
+from ai_transport import Cancelled, model_response
 
 
 DEFAULTS = {'provider': 'custom', 'base_url': '', 'model': '', 'api_key': '', 'stream': True,
-            'vision': False, 'timeout': 90, 'max_rounds': 24}
+            'vision': False, 'timeout': 0, 'max_rounds': 0}
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_STREAM_BYTES = 64 * 1024 * 1024
-
-
-class Cancelled(Exception):
-    pass
 
 
 def configuration():
@@ -47,10 +43,13 @@ def validate_config(value):
         raise ValueError('请填写有效的 HTTP(S) API 地址，不要在地址中包含密钥或查询参数。')
     if not cfg['model']:
         raise ValueError('请填写模型名称，且模型须支持工具调用。')
-    cfg['timeout'] = int(cfg['timeout'])
-    cfg['max_rounds'] = int(cfg['max_rounds'])
-    if not 10 <= cfg['timeout'] <= 600 or not 1 <= cfg['max_rounds'] <= 100:
-        raise ValueError('超时需为 10–600 秒，工具循环上限需为 1–100。')
+    try:
+        cfg['timeout'] = int(cfg['timeout'])
+        cfg['max_rounds'] = int(cfg['max_rounds'])
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError('请求超时和工具轮数需为非负整数，0 表示无限制。') from error
+    if cfg['timeout'] < 0 or cfg['max_rounds'] < 0:
+        raise ValueError('请求超时和工具轮数需为非负整数，0 表示无限制。')
     return {key: cfg[key] for key in DEFAULTS}
 
 
@@ -71,7 +70,6 @@ class ModelClient:
         if cancel.is_set():
             raise Cancelled()
         cfg = self.config
-        deadline = time.monotonic() + cfg['timeout']
         endpoint = cfg['base_url']
         if not endpoint.endswith('/chat/completions'):
             endpoint += '/chat/completions'
@@ -83,8 +81,8 @@ class ModelClient:
             payload.update(tools=schemas, tool_choice='auto')
         try:
             # Disable redirects: custom API credentials must stay on the configured endpoint.
-            with requests.post(endpoint, headers=headers, json=payload, stream=True,
-                               timeout=(10, cfg['timeout']), allow_redirects=False) as response:
+            with model_response(endpoint, cancel, cfg['timeout'], headers=headers, json=payload,
+                                stream=True, allow_redirects=False) as response:
                 if response.status_code != 200:
                     hints = {401: 'API Key 无效', 403: '接口拒绝访问', 404: '检查 API 地址与模型名',
                              429: '额度不足或请求过于频繁'}
@@ -95,8 +93,6 @@ class ModelClient:
                     for chunk in response.iter_content(8192):
                         if cancel.is_set():
                             raise Cancelled()
-                        if time.monotonic() > deadline:
-                            raise RuntimeError('模型请求超过设置的超时时间。')
                         raw.extend(chunk)
                         if len(raw) > MAX_RESPONSE_BYTES:
                             raise RuntimeError('模型回复内容过大，请分批生成文件或缩小本轮任务。')
@@ -113,8 +109,6 @@ class ModelClient:
                 for line in response.iter_lines(chunk_size=1):
                     if cancel.is_set():
                         raise Cancelled()
-                    if time.monotonic() > deadline:
-                        raise RuntimeError('模型请求超过设置的超时时间。')
                     total += len(line)
                     if total > MAX_STREAM_BYTES:
                         raise RuntimeError('模型流式数据过大，请重试或关闭流式输出。')

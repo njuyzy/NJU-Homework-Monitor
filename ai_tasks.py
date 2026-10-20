@@ -245,7 +245,9 @@ class TaskManager:
                 self.persist_jobs()
 
     def _turn(self, job, client, kit, cancel, max_rounds):
-        for _ in range(max_rounds):
+        rounds = 0
+        while max_rounds == 0 or rounds < max_rounds:
+            rounds += 1
             if cancel.is_set():
                 raise Cancelled()
             with self.lock:

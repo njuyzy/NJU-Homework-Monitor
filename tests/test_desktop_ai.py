@@ -54,6 +54,10 @@ def test_ai_page_and_model_configuration(tmp_path, monkeypatch):
             url = dialog.findChild(QLineEdit, 'modelBaseUrl')
             model = dialog.findChild(QComboBox, 'modelName')
             key = dialog.findChild(QLineEdit, 'modelApiKey')
+            timeout = dialog.findChild(QLineEdit, 'modelTimeout')
+            rounds = dialog.findChild(QLineEdit, 'modelRounds')
+            assert timeout.text() == rounds.text() == '0'
+            assert '无限制' in timeout.placeholderText()
             from ai_presets import PRESETS
             url.setText('http://localhost:1234/v1'); model.setCurrentText('custom-model'); key.setText('test-ui-key')
             for name in ('deepseek', 'openai', 'anthropic', 'kimi', 'kimi_global', 'gemini', 'grok'):
@@ -61,6 +65,7 @@ def test_ai_page_and_model_configuration(tmp_path, monkeypatch):
                 assert url.text() == PRESETS[name]['base_url']
                 assert model.currentText() == PRESETS[name]['models'][0]
                 assert key.text() == ''
+                assert timeout.text() == rounds.text() == '0'
             provider.setCurrentIndex(provider.findData('custom'))
             assert model.currentText() == 'custom-model' and key.text() == 'test-ui-key'
             assert url.text() == 'http://localhost:1234/v1'
@@ -73,5 +78,47 @@ def test_ai_page_and_model_configuration(tmp_path, monkeypatch):
     assert not errors
     from ai_models import configuration
     assert configuration()['model'] == 'custom-model'
+    assert configuration()['timeout'] == configuration()['max_rounds'] == 0
     assert b'test-ui-key' not in (tmp_path / 'ai-model.dpapi').read_bytes()
+    window.close()
+
+
+def test_closing_model_dialog_cancels_unlimited_connection_test(tmp_path, monkeypatch):
+    import threading
+    import time
+    import ai_models
+    monkeypatch.setattr(storage, 'DATA', tmp_path)
+    ai_models.save_configuration({'base_url': 'http://localhost:1234/v1', 'model': 'local',
+                                  'timeout': 0, 'max_rounds': 0})
+    monkeypatch.setattr(desktop_app.backend, 'monitor', lambda: None)
+    monkeypatch.setattr(desktop_app.MainWindow, 'check_updates', lambda self: None)
+    monkeypatch.setattr(desktop_app, 'bridge', ai_tasks.TaskManager())
+    entered, stopped = threading.Event(), threading.Event()
+    def complete(self, messages, schemas, cancel):
+        entered.set()
+        if cancel.wait(3):
+            stopped.set()
+            raise ai_models.Cancelled()
+        raise AssertionError('连接测试没有取消')
+    monkeypatch.setattr(ai_models.ModelClient, 'complete', complete)
+    app = QApplication.instance() or QApplication([])
+    window = desktop_app.MainWindow()
+    errors = []
+    def start_and_close():
+        dialog = app.activeModalWidget()
+        try:
+            next(b for b in dialog.findChildren(QPushButton) if b.text() == '测试连接与工具调用').click()
+            assert entered.wait(2)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            dialog.reject()
+    QTimer.singleShot(0, start_and_close)
+    window.configure_model()
+    assert stopped.wait(2)
+    deadline = time.monotonic() + 2
+    while window.active_workers and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(.01)
+    assert not errors and not window.active_workers and not window._model_test_cancels
     window.close()

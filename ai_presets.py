@@ -64,4 +64,4 @@ def preset_configuration(provider):
     preset = PRESETS[provider]
     return {'provider': provider, 'base_url': preset['base_url'],
             'model': next(iter(preset['models']), ''), 'api_key': '',
-            'stream': True, 'vision': preset['vision'], 'timeout': 180, 'max_rounds': 24}
+            'stream': True, 'vision': preset['vision'], 'timeout': 0, 'max_rounds': 0}

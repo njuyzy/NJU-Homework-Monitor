@@ -257,6 +257,7 @@ class MainWindow(QMainWindow):
         self._update_package = None
         self._restarting_for_update = False
         self._closing = False
+        self._model_test_cancels = set()
         self.nav_names = ('作业总览', 'AI 任务', '我的课程', '提醒设置')
         self.page_animation = None
         self.build_ui()
@@ -1116,12 +1117,13 @@ class MainWindow(QMainWindow):
         vision = ToggleSwitch(); vision.setChecked(cfg['vision'])
         timeout = QLineEdit(str(cfg['timeout'])); rounds = QLineEdit(str(cfg['max_rounds']))
         timeout.setObjectName('modelTimeout'); rounds.setObjectName('modelRounds')
+        timeout.setPlaceholderText('0 表示无限制'); rounds.setPlaceholderText('0 表示无限制')
         form.addRow('API 地址', url); form.addRow('模型名称', model); form.addRow('API Key', key)
         provider_note = QLabel(); provider_note.setObjectName('muted'); provider_note.setWordWrap(True)
         form.addRow(provider_note)
         form.addRow('流式输出', stream); form.addRow('视觉输入（模型需支持）', vision)
-        form.addRow('请求超时 / 秒', timeout); form.addRow('工具循环上限', rounds)
-        note = QLabel('各服务商的配置分别加密保存；点击保存后切换生效。\n地址、模型名均可修改；模型是否可用以账号权限和连接测试为准。')
+        form.addRow('请求超时 / 秒（0 为不限）', timeout); form.addRow('工具轮数（0 为不限）', rounds)
+        note = QLabel('默认不限请求时间和工具轮数，可随时手动停止任务。\n各服务商的配置分别加密保存；保存后用于新启动或继续的任务。\n地址、模型名均可修改；模型是否可用以账号权限和连接测试为准。')
         note.setObjectName('muted'); note.setWordWrap(True); form.addRow(note)
         actions = QHBoxLayout()
         test = QPushButton('测试连接与工具调用'); save = QPushButton('保存配置'); save.setObjectName('primaryButton')
@@ -1163,22 +1165,42 @@ class MainWindow(QMainWindow):
 
         def test_model():
             from ai_tools import SCHEMAS
+            from ai_models import Cancelled
             try:
                 client = ModelClient(values())
             except Exception as error:
                 QMessageBox.warning(dialog, '配置无效', str(error)); return
+            cancel = threading.Event()
+            self._model_test_cancels.add(cancel)
+            dialog.finished.connect(lambda _: cancel.set())
             def check():
-                answer = client.complete([{'role': 'user', 'content': '请调用 list_files 工具，path 为 .。不要直接回复文字。'}],
-                                         [SCHEMAS[0]], threading.Event())
-                if not any(c['function']['name'] == 'list_files' for c in answer.get('tool_calls', [])):
-                    raise RuntimeError('模型可以连接，但没有返回工具调用。请确认模型和接口支持 tools。')
-            self.run_async(check, '模型连接与工具调用测试通过')
+                try:
+                    answer = client.complete([{'role': 'user', 'content': '请调用 list_files 工具，path 为 .。不要直接回复文字。'}],
+                                             [SCHEMAS[0]], cancel)
+                    if not any(c['function']['name'] == 'list_files' for c in answer.get('tool_calls', [])):
+                        raise RuntimeError('模型可以连接，但没有返回工具调用。请确认模型和接口支持 tools。')
+                    return True
+                except Cancelled:
+                    return False
+                finally:
+                    self._model_test_cancels.discard(cancel)
+            worker = Worker(check)
+            self.active_workers.add(worker)
+            worker.signals.done.connect(lambda ok: self.statusBar().showMessage('模型连接与工具调用测试通过', 3500)
+                                        if ok and not cancel.is_set() and not self._closing else None)
+            worker.signals.failed.connect(lambda message: QMessageBox.warning(dialog, '操作未完成', message)
+                                          if not cancel.is_set() and not self._closing else None)
+            worker.signals.done.connect(lambda _: self.active_workers.discard(worker))
+            worker.signals.failed.connect(lambda _: self.active_workers.discard(worker))
+            self.thread_pool.start(worker)
 
         save.clicked.connect(save_model); test.clicked.connect(test_model)
         dialog.exec()
 
     def closeEvent(self, event):
         self._closing = True
+        for cancel in self._model_test_cancels.copy():
+            cancel.set()
         if self._update_cancel and not self._restarting_for_update:
             self._update_cancel.set()
             if self._update_package:

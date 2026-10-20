@@ -62,6 +62,7 @@ def format_date(value):
 class WorkerSignals(QObject):
     done = Signal(object)
     failed = Signal(str)
+    progress = Signal(int, int)
 
 
 class Worker(QRunnable):
@@ -251,6 +252,11 @@ class MainWindow(QMainWindow):
         self.active_workers = set()
         self.update_info = None
         self.checking_updates = False
+        self.downloading_update = False
+        self._update_cancel = None
+        self._update_package = None
+        self._restarting_for_update = False
+        self._closing = False
         self.nav_names = ('作业总览', 'AI 任务', '我的课程', '提醒设置')
         self.page_animation = None
         self.build_ui()
@@ -657,7 +663,7 @@ class MainWindow(QMainWindow):
         self.thread_pool.start(worker)
 
     def check_updates(self):
-        if self.checking_updates:
+        if self.checking_updates or self.downloading_update or self._closing:
             return
         self.checking_updates = True
         worker = Worker(updates.check_for_update)
@@ -672,28 +678,80 @@ class MainWindow(QMainWindow):
         self.thread_pool.start(worker)
 
     def show_update(self, info):
+        if self.downloading_update or self._closing:
+            return
         self.update_info = info
         self.update_button.setVisible(bool(info))
         if info:
             self.update_button.setText('↑ 更新可用' if info['ready'] else '↑ 发现更新 · 打包中')
-            self.update_button.setToolTip('点击查看新版与下载说明')
+            self.update_button.setToolTip('点击下载、安装并重启应用' if info['ready'] else '点击查看构建进度')
 
     def open_update(self):
         info = self.update_info
-        if not info:
+        if not info or self.downloading_update or self._closing:
             return
-        if info['ready']:
-            message = '新版已准备好。下载发布页中的 NJU-Homework-Monitor.exe，关闭当前程序后替换原 EXE，保留同目录的 data 文件夹即可保留设置和作业数据。'
-        else:
-            message = '发现新的代码更新，安装包尚未发布。可在构建页面查看进度，程序会自动再次检查。'
-        dialog = QMessageBox(self)
-        dialog.setWindowTitle('应用更新')
-        dialog.setText(message)
-        open_button = dialog.addButton('打开下载页' if info['ready'] else '查看构建进度', QMessageBox.ButtonRole.AcceptRole)
-        dialog.addButton('稍后', QMessageBox.ButtonRole.RejectRole)
-        dialog.exec()
-        if dialog.clickedButton() == open_button:
+        if not info['ready']:
             QDesktopServices.openUrl(QUrl(info['url']))
+            return
+        if not updates.can_auto_update():
+            QMessageBox.information(self, '应用更新', '自动安装适用于 Windows EXE 版本。源代码运行时请通过 Git 更新项目。')
+            return
+        self.downloading_update = True
+        self._update_cancel = threading.Event()
+        self.update_button.setEnabled(False)
+        self.update_button.setText('↓ 正在准备更新…')
+        cancel = self._update_cancel
+
+        def download():
+            last_percent = -1
+            def progress(done, total):
+                nonlocal last_percent
+                percent = done * 100 // total
+                if percent != last_percent:
+                    last_percent = percent
+                    worker.signals.progress.emit(done, total)
+            package = updates.download_update(info, Path(sys.executable), progress, cancel)
+            self._update_package = package
+            try:
+                updates.launch_installer(package, storage.DATA / 'update.log', cancel)
+            except Exception:
+                if not (Path(package['work_dir']) / 'install.ps1').exists():
+                    updates.cleanup_download(package)
+                raise
+            return package
+
+        worker = Worker(download)
+        self.active_workers.add(worker)
+        worker.signals.progress.connect(self._show_download_progress)
+        def finished(package):
+            self.active_workers.discard(worker)
+            if self._closing or cancel.is_set():
+                (Path(package['work_dir']) / 'abort').touch()
+                return
+            self._restarting_for_update = True
+            self.update_button.setText('正在安装并重启…')
+            self.statusBar().showMessage('下载与校验已完成，正在保存进度并重启…')
+            self.close()
+        def failed(message):
+            self.active_workers.discard(worker)
+            self.downloading_update = False
+            self._update_package = None
+            self._update_cancel = None
+            if not self._closing:
+                self.update_button.setEnabled(True)
+                self.show_update(self.update_info)
+                self.statusBar().showMessage('更新未完成，可点击更新按钮重试', 5000)
+                QMessageBox.warning(self, '更新未完成', message[:500])
+        worker.signals.done.connect(finished)
+        worker.signals.failed.connect(failed)
+        self.thread_pool.start(worker)
+
+    def _show_download_progress(self, done, total):
+        if self._closing:
+            return
+        percent = done * 100 // total
+        self.update_button.setText(f'↓ 下载更新 {percent}%')
+        self.statusBar().showMessage(f'下载新版：{done / 1048576:.1f} / {total / 1048576:.1f} MB，完成后自动安装并重启')
 
     def select_task_filter(self, mode):
         self.task_filter.setCurrentIndex(self.task_filter.findData(mode))
@@ -1120,6 +1178,13 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def closeEvent(self, event):
+        self._closing = True
+        if self._update_cancel and not self._restarting_for_update:
+            self._update_cancel.set()
+            if self._update_package:
+                work = Path(self._update_package['work_dir'])
+                if work.is_dir():
+                    (work / 'abort').touch()
         self.timer.stop()
         self.ai_timer.stop()
         self.update_timer.stop()
@@ -1164,6 +1229,7 @@ def main():
             import traceback
             traceback.print_exc(file=sys.stderr)
             return 1
+    restart_acknowledgement = updates.consume_restart_argument(sys.argv)
     qt_app = QApplication(sys.argv)
     qt_app.setApplicationName('课后')
     instance_lock = acquire_instance_lock()
@@ -1173,6 +1239,8 @@ def main():
     qt_app.aboutToQuit.connect(lambda: release_instance_lock(instance_lock))
     window = MainWindow()
     window.show()
+    if restart_acknowledgement:
+        QTimer.singleShot(0, lambda: updates.mark_restart_ready(restart_acknowledgement))
     return qt_app.exec()
 
 

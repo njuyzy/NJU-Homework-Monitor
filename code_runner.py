@@ -7,12 +7,38 @@ import sys
 from pathlib import Path
 
 
+def prepare_stdio():
+    # PyInstaller's windowed bootloader leaves sys.std* unset even when the
+    # parent supplied pipes. Recover those inherited handles before sandboxing.
+    for name, mode, handle_id in (('stdin', 'r', -10), ('stdout', 'w', -11), ('stderr', 'w', -12)):
+        stream = getattr(sys, name)
+        if stream is None and os.name == 'nt':
+            import ctypes
+            import msvcrt
+            get_handle = ctypes.windll.kernel32.GetStdHandle
+            get_handle.argtypes = [ctypes.c_ulong]
+            get_handle.restype = ctypes.c_void_p
+            handle = get_handle(handle_id & 0xffffffff)
+            if handle and handle != ctypes.c_void_p(-1).value:
+                flags = (os.O_RDONLY if mode == 'r' else os.O_WRONLY) | os.O_BINARY
+                stream = open(msvcrt.open_osfhandle(handle, flags), mode, encoding='utf-8', errors='replace')
+                setattr(sys, name, stream)
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8', errors='replace')
+
+
 def main(argv=None):
+    prepare_stdio()
     argv = list(argv or sys.argv[1:])
     if len(argv) < 2:
         raise SystemExit('usage: code_runner.py WORKSPACE SOURCE [args...]')
     workspace, source = Path(argv[0]).resolve(), Path(argv[1]).resolve()
     runner_file = Path(__file__).resolve()
+    # Frozen imports read their PYZ archive from the executable itself, which
+    # lives outside _MEIPASS. Allow that one file for reads, not its directory.
+    readable_files = {runner_file}
+    if getattr(sys, 'frozen', False):
+        readable_files.add(Path(sys.executable).resolve())
     if not source.is_file() or not source.is_relative_to(workspace):
         raise SystemExit('source must be a file inside the workspace')
     readable_roots = [workspace, Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve()]
@@ -31,7 +57,7 @@ def main(argv=None):
             path = args[0]
             mode = str(args[1]) if len(args) > 1 else 'r'
             writing = any(flag in mode for flag in ('w', 'a', 'x', '+'))
-            readable = inside(path, readable_roots) or (not writing and Path(path).resolve() == runner_file)
+            readable = inside(path, readable_roots) or (not writing and Path(path).resolve() in readable_files)
             if writing and not inside(path, [workspace]) or not writing and not readable:
                 raise PermissionError('代码只能写入任务目录，不能读取任务目录外的普通文件。')
         if event in ('socket.connect', 'socket.bind', 'socket.getaddrinfo', 'subprocess.Popen',

@@ -175,6 +175,28 @@ def test_truncated_stream_never_returns_partial_tool(monkeypatch):
         ai_models.ModelClient(CONFIG).complete([], [], threading.Event())
 
 
+def test_stream_envelopes_do_not_exhaust_reply_limit(monkeypatch):
+    monkeypatch.setattr(ai_models, 'MAX_RESPONSE_BYTES', 2000)
+    monkeypatch.setattr(ai_models, 'MAX_STREAM_BYTES', 20000)
+    lines = [event({'content': 'x'}) for _ in range(100)] + [event({}, 'stop')]
+    assert sum(map(len, lines)) > ai_models.MAX_RESPONSE_BYTES
+    monkeypatch.setattr(ai_models.requests, 'post', lambda *a, **k: Response(lines=lines))
+    answer = ai_models.ModelClient(CONFIG).complete([], [], threading.Event())
+    assert answer['content'] == 'x' * 100
+
+
+@pytest.mark.parametrize('kind', ['payload', 'wire', 'nonstream'])
+def test_response_limits_still_reject_oversized_data(monkeypatch, kind):
+    monkeypatch.setattr(ai_models, 'MAX_RESPONSE_BYTES', 300)
+    monkeypatch.setattr(ai_models, 'MAX_STREAM_BYTES', 600)
+    response = (Response(result={'choices': [{'message': {'content': 'x' * 800}, 'finish_reason': 'stop'}]})
+                if kind == 'nonstream' else Response(lines=[event({'content': 'x' * 400})] if kind == 'payload'
+                                                     else [b': heartbeat ' + b'x' * 700]))
+    monkeypatch.setattr(ai_models.requests, 'post', lambda *a, **k: response)
+    with pytest.raises(RuntimeError, match='过大'):
+        ai_models.ModelClient(CONFIG | {'stream': kind != 'nonstream'}).complete([], [], threading.Event())
+
+
 def test_nonstream_and_http_failure(monkeypatch):
     monkeypatch.setattr(ai_models.requests, 'post', lambda *a, **k: Response(result={
         'choices': [{'message': {'content': '完成'}, 'finish_reason': 'stop'}]}))
@@ -263,9 +285,12 @@ def test_round_limit_keeps_valid_tool_history(monkeypatch):
         'tool_calls': [tool_call('list_files', {})]})
     manager = ai_tasks.TaskManager(); manager.launch(task())
     job = wait_job(manager)
-    assert job['state'] == 'error' and '上限' in job['message']
+    assert job['state'] == 'interrupted' and '继续' in job['message']
     messages = manager.jobs['assign-1']['messages']
     assert len([m for m in messages if m['role'] == 'tool']) == CONFIG['max_rounds']
+    monkeypatch.setattr(ai_tasks.ModelClient, 'complete', lambda *args: {'role': 'assistant', 'content': '恢复完成'})
+    manager.reconnect('assign-1')
+    assert wait_job(manager)['state'] == 'completed'
 
 
 def test_timeout_after_stop_stays_interrupted(monkeypatch):
@@ -379,6 +404,27 @@ def test_python_runner_blocks_host_access(kit, source, marker):
     result = kit.run_code('python', 'unsafe.py', timeout=10)
     assert result['exit_code'] != 0 and marker in result['stderr']
     assert outside.read_text(encoding='utf-8') == 'secret'
+
+
+@pytest.mark.parametrize('read_archive', [True, False])
+def test_frozen_runner_can_read_only_its_own_archive_outside_workspace(kit, read_archive):
+    import sys
+    archive = kit.root.parent / 'app.exe'
+    archive.write_bytes(b'bundled library')
+    neighbor = kit.root.parent / 'private.txt'
+    neighbor.write_text('private', encoding='utf-8')
+    target = archive if read_archive else neighbor
+    kit.write_file('probe.py', f'print(open({str(target)!r}, "rb").read().decode())')
+    command = [sys.executable, '-c',
+               f'import sys; sys.path.insert(0, {str(Path(ai_tools.__file__).parent)!r}); '
+               f'import code_runner; sys.frozen=True; sys.executable={str(archive)!r}; '
+               + ('sys.stdin=sys.stdout=sys.stderr=None; ' if sys.platform == 'win32' else '') +
+               f'code_runner.main([{str(kit.root)!r}, {str(kit.root / "probe.py")!r}])']
+    result = kit._run_process(command, kit.root, '', 10)
+    if read_archive:
+        assert result['exit_code'] == 0 and 'bundled library' in result['stdout']
+    else:
+        assert result['exit_code'] != 0 and 'PermissionError' in result['stderr']
 
 
 def test_run_code_timeout_and_output_limit(kit):

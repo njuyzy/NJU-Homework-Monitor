@@ -26,6 +26,7 @@ try {
         '--collect-all', 'playwright', '--collect-all', 'windows_toasts',
         '--add-data', 'static;static',
         '--add-data', 'build/build-info.json;.',
+        '--collect-submodules', 'xml.sax',
         '--hidden-import', 'winrt.windows.ui.notifications'
     )
     foreach ($dll in @($codecvtDll, $vcompDll)) {

@@ -23,6 +23,7 @@ import archived_tasks
 import ignored_tasks
 import storage
 import updates
+from chat_view import ChatView
 from task_status import deadline, display_status, matches_filter
 from ai_tasks import manager as bridge
 from ai_models import ModelClient, configuration, model_profiles, save_configuration
@@ -478,7 +479,7 @@ class MainWindow(QMainWindow):
         self.job_progress = QProgressBar(); self.job_progress.setRange(0, 0)
         self.job_progress.setTextVisible(False); self.job_progress.setFixedHeight(3); self.job_progress.hide()
         self.job_progress.setStyleSheet('QProgressBar { border: none; background: #f2edf8; } QProgressBar::chunk { background: #a98bc0; }')
-        self.job_output = QTextBrowser(); self.job_output.setOpenExternalLinks(True)
+        self.job_output = ChatView()
         self.job_input = QTextEdit(); self.job_input.setPlaceholderText('给 AI 补充要求…'); self.job_input.setMaximumHeight(95)
         attach_row = QHBoxLayout()
         self.attach_button = QPushButton('📎 附件'); self.attach_button.clicked.connect(self.attach_files)
@@ -834,7 +835,7 @@ class MainWindow(QMainWindow):
         if not job:
             self.job_progress.hide()
             self.job_title.setText('选择一个 AI 任务'); self.job_state.setText('等待任务')
-            self.job_output.setPlainText('✦\n\nAI 输出会同步到这里\n\n启动作业任务后，可以留在本页查看进度并继续对话。')
+            self.job_output.show_conversation(None, [])
             for button in (self.stop_job, self.reconnect_job_button, self.send_job, self.attach_button): button.setEnabled(False)
             for action in (self.menu_open_workspace, self.menu_copy_id): action.setEnabled(False)
             self.job_input.setEnabled(False)
@@ -842,14 +843,8 @@ class MainWindow(QMainWindow):
             self.job_files.clear()
             return
         self.job_title.setText(job.get('title', 'AI 任务')); self.job_state.setText(JOB_TEXT.get(job.get('state'), job.get('state', '')))
-        blocks = []
-        for entry in job.get('entries', [])[-200:]: blocks.append({'user': '你', 'assistant': 'AI', 'tool': '工具'}.get(entry.get('role'), 'AI') + '\n' + entry.get('text', ''))
-        if job.get('state') in ('starting', 'running'): blocks.append('处理动态\n' + job.get('activity', job.get('message', '正在处理…')))
-        bar = self.job_output.verticalScrollBar()
-        follow = bar.maximum() - bar.value() < 30
-        old_scroll = bar.value()
-        self.job_output.setPlainText('\n\n'.join(blocks) or job.get('message', '等待输出'))
-        bar.setValue(bar.maximum() if follow else old_scroll)
+        activity = job.get('activity', job.get('message', '正在处理…')) if job.get('state') in ('starting', 'running') else ''
+        self.job_output.show_conversation(self.selected_job, job.get('entries', []), activity, job.get('workspace'))
         running = job.get('state') in ('starting', 'running')
         self.job_progress.setVisible(running or job.get('state') == 'stopping')
         self.stop_job.setEnabled(running)
@@ -1160,7 +1155,15 @@ def main():
     if '--code-worker' in sys.argv:
         index = sys.argv.index('--code-worker')
         from code_runner import main as code_main
-        code_main(sys.argv[index + 1:]); return 0
+        try:
+            code_main(sys.argv[index + 1:])
+            return 0
+        except Exception:
+            # Send execution errors back to the tool instead of displaying a
+            # blocking PyInstaller error dialog in a background child process.
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            return 1
     qt_app = QApplication(sys.argv)
     qt_app.setApplicationName('课后')
     instance_lock = acquire_instance_lock()

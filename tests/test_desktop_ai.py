@@ -10,6 +10,17 @@ import ai_tasks
 import desktop_app
 
 
+def test_code_worker_errors_return_failure_without_gui_dialog(monkeypatch, capsys):
+    import code_runner
+    monkeypatch.setattr(desktop_app, '_install_excepthook', lambda: None)
+    monkeypatch.setattr(desktop_app.sys, 'argv', ['app.exe', '--code-worker', 'workspace', 'source.py'])
+    def fail(args):
+        raise ModuleNotFoundError('missing-test-library')
+    monkeypatch.setattr(code_runner, 'main', fail)
+    assert desktop_app.main() == 1
+    assert 'missing-test-library' in capsys.readouterr().err
+
+
 def test_ai_page_and_model_configuration(tmp_path, monkeypatch):
     monkeypatch.setattr(storage, 'DATA', tmp_path)
     monkeypatch.setattr(desktop_app.backend, 'monitor', lambda: None)

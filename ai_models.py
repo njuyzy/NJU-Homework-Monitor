@@ -11,6 +11,8 @@ from ai_presets import PRESETS, detect_provider
 
 DEFAULTS = {'provider': 'custom', 'base_url': '', 'model': '', 'api_key': '', 'stream': True,
             'vision': False, 'timeout': 90, 'max_rounds': 24}
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_STREAM_BYTES = 64 * 1024 * 1024
 
 
 class Cancelled(Exception):
@@ -96,8 +98,8 @@ class ModelClient:
                         if time.monotonic() > deadline:
                             raise RuntimeError('模型请求超过设置的超时时间。')
                         raw.extend(chunk)
-                        if len(raw) > 8 * 1024 * 1024:
-                            raise RuntimeError('模型响应过大。')
+                        if len(raw) > MAX_RESPONSE_BYTES:
+                            raise RuntimeError('模型回复内容过大，请分批生成文件或缩小本轮任务。')
                     result = json.loads(raw)
                     choice = result['choices'][0]
                     self._check_finish(choice.get('finish_reason'))
@@ -107,14 +109,15 @@ class ModelClient:
                 content, reasoning, calls, finish = '', '', {}, None
                 extra_content = {}
                 total = 0
+                payload_size = 0
                 for line in response.iter_lines(chunk_size=1):
                     if cancel.is_set():
                         raise Cancelled()
                     if time.monotonic() > deadline:
                         raise RuntimeError('模型请求超过设置的超时时间。')
                     total += len(line)
-                    if total > 8 * 1024 * 1024:
-                        raise RuntimeError('模型响应过大。')
+                    if total > MAX_STREAM_BYTES:
+                        raise RuntimeError('模型流式数据过大，请重试或关闭流式输出。')
                     if not line.startswith(b'data:'):
                         continue
                     data = line[5:].strip()
@@ -127,6 +130,12 @@ class ModelClient:
                         continue
                     choice = event['choices'][0]
                     delta = choice.get('delta', {})
+                    # SSE repeats the protocol envelope for every token. Bound the
+                    # useful deltas separately so small chunks do not exhaust the
+                    # reply limit before a normal answer is complete.
+                    payload_size += len(json.dumps(delta, ensure_ascii=False).encode('utf-8'))
+                    if payload_size > MAX_RESPONSE_BYTES:
+                        raise RuntimeError('模型回复内容过大，请分批生成文件或缩小本轮任务。')
                     text = delta.get('content') or ''
                     content += text
                     reasoning += delta.get('reasoning_content') or ''

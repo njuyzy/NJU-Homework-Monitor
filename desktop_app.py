@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 import app as backend
+import archived_tasks
 import ignored_tasks
 import storage
 import updates
@@ -143,6 +144,7 @@ class TaskCard(QFrame):
     details = Signal(str)
     launch_ai = Signal(str)
     ignore_changed = Signal(str, bool)
+    archive_requested = Signal(str)
 
     def __init__(self, task, job=None):
         super().__init__()
@@ -187,6 +189,9 @@ class TaskCard(QFrame):
         source = QPushButton('打开作业 ↗')
         source.setObjectName('linkButtonSmall')
         source.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(task.get('url', ''))))
+        archive = QPushButton('归档')
+        archive.setObjectName('linkButtonSmall')
+        archive.clicked.connect(lambda: self.archive_requested.emit(task['id']))
         actions.addWidget(ai)
         if status in ('overdue', 'ignored'):
             ignore = QPushButton('恢复关注' if status == 'ignored' else '忽略逾期')
@@ -194,6 +199,7 @@ class TaskCard(QFrame):
             ignore.clicked.connect(lambda: self.ignore_changed.emit(task['id'], status != 'ignored'))
             actions.addWidget(ignore)
         actions.addWidget(source)
+        actions.addWidget(archive)
         row.addWidget(symbol, 0, Qt.AlignmentFlag.AlignTop)
         row.addLayout(text, 1)
         row.addLayout(actions)
@@ -705,6 +711,8 @@ class MainWindow(QMainWindow):
         self.status_label.setText(state.get('message', '准备同步'))
         self.sync_button.setEnabled(state.get('phase') != 'syncing')
         tasks = ignored_tasks.annotate(self.snapshot.get('tasks', []))
+        tasks = archived_tasks.visible(tasks)
+        self.snapshot['tasks'] = tasks
         pending_count = sum(matches_filter(task, 'pending') for task in tasks)
         self.nav_buttons[0].setText(f'▦   作业总览                         {pending_count}')
         self.nav_buttons[1].setText(f'✦   AI 任务                       {len(bridge.jobs_snapshot())}')
@@ -773,6 +781,7 @@ class MainWindow(QMainWindow):
             card.details.connect(self.show_task)
             card.launch_ai.connect(self.launch_ai)
             card.ignore_changed.connect(self.set_task_ignored)
+            card.archive_requested.connect(self.archive_task)
             self.task_layout.addWidget(card)
         if not tasks:
             empty = QLabel('⌁\n\n这里暂时没有符合条件的作业。')
@@ -895,6 +904,10 @@ class MainWindow(QMainWindow):
             ignore.setObjectName('softButton')
             ignore.clicked.connect(lambda: (dialog.accept(), self.set_task_ignored(task_id, status != 'ignored')))
             buttons.addWidget(ignore)
+        archive = QPushButton('归档')
+        archive.setObjectName('softButton')
+        archive.clicked.connect(lambda: (dialog.accept(), self.archive_task(task_id)))
+        buttons.addWidget(archive)
         buttons.addStretch(); buttons.addWidget(ai)
         layout.addWidget(QLabel(task.get('course', ''))); layout.addWidget(title); layout.addWidget(QLabel(format_date(task.get('due')))); layout.addWidget(description, 1); layout.addLayout(buttons)
         dialog.exec()
@@ -907,6 +920,14 @@ class MainWindow(QMainWindow):
         task['ignored'] = ignored
         self.refresh_ui(force=True)
         self.statusBar().showMessage('已忽略该逾期作业' if ignored else '已恢复关注该作业', 3000)
+
+    def archive_task(self, task_id):
+        task = next((t for t in self.snapshot.get('tasks', []) if t['id'] == task_id), None)
+        if not task:
+            return
+        archived_tasks.archive(task)
+        self.refresh_ui(force=True)
+        self.statusBar().showMessage('任务已归档', 3000)
 
     def launch_ai(self, task_id):
         task = next((t for t in self.snapshot.get('tasks', []) if t['id'] == task_id), None)

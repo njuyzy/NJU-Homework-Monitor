@@ -70,6 +70,10 @@ def test_clickable_stats_combined_filters_and_update_button(tmp_path, monkeypatc
     assert window.update_button.text() == '↑ 更新可用'
     window.show_update(None)
     assert window.update_button.isHidden()
+    window.task_filter.setCurrentIndex(window.task_filter.findData('all'))
+    archive = next(button for button in visible_cards()[0].findChildren(QPushButton) if button.text() == '归档')
+    archive.click()
+    assert len(visible_cards()) == 3
     window.close()
     app.processEvents()
 

@@ -6,6 +6,7 @@ import pytest
 import storage
 import moodle
 import app
+import archived_tasks
 import ignored_tasks
 
 
@@ -89,6 +90,12 @@ def test_ignored_overdue_task_does_not_remind():
     due = datetime.fromisoformat(task()['due'])
     ignored_tasks.set_ignored(task())
     assert app.reminder_bucket(task(), due, [24]) is None
+
+
+def test_archived_task_does_not_remind():
+    due = datetime.fromisoformat(task()['due'])
+    archived_tasks.archive(task())
+    assert app.reminder_bucket(task(), due - timedelta(hours=1), [24]) is None
 
 
 def test_dedup_and_failed_notification_retry(monkeypatch):
